@@ -1,0 +1,17 @@
+[package]
+name = "elphie-oauth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+rmcp = { version = "3.11.0", default-features = false, features = ["client", "auth", "reqwest-native-tls"] }
+url = "2"
+
+[dev-dependencies]
+axum = "0.8"
+base64 = "0.22"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt"] }
