@@ -6,3 +6,23 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
+
+[package]
+name = "elphie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A terminal chat client and ACP v2 agent"
+
+[dependencies]
+agent-client-protocol = { version = "=5.4.0", features = ["process", "unstable_protocol_v2"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+elphie-acp = { path = "crates/elphie-acp" }
+elphie-core = { path = "crates/elphie-core" }
+elphie-providers = { path = "crates/elphie-providers" }
+elphie-signin = { path = "crates/elphie-signin" }
+futures-util = "0.3"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
