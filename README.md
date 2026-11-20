@@ -22,7 +22,9 @@ The default model is `gpt-6.1-sol`. Use `elphie --model <model>` to select anoth
 elphie --provider ollama --model llama3.2
 ```
 
-Press Enter to send, Esc to cancel the current turn, Page Up or Page Down to scroll, and Ctrl+C to quit. Each response appears when the provider finishes. Conversation history stays in the server process until it exits.
+Type `/model` to open the model picker immediately. You can also type `/` and press Tab. Use ↑ or ↓ to highlight a model from the current provider. Press Enter to select it or Esc to keep the current model. The next message uses that model with the same conversation history. Each session has its own selection.
+
+Press Shift+Enter to add a line. If your terminal sends the same key code for Enter and Shift+Enter, use Ctrl+J or Alt+Enter. Press Enter to send the whole message. Esc cancels the current turn, Page Up and Page Down scroll the conversation, and Ctrl+C quits. Each response appears when the provider finishes. Conversation history stays in the server process until it exits.
 
 ## Connect a desktop client
 
@@ -66,7 +68,7 @@ cargo build --locked
 python3 tests/terminal.py
 ```
 
-The last check needs a Unix pseudo-terminal. It drives the actual terminal and server through two turns and cancellation against a local HTTP fixture. The checks use local test credentials and model responses.
+The last check needs a Unix pseudo-terminal. It opens the picker by typing `/model`, sends a multiline message to the selected model, checks the conversation history, and cancels both a selection and a prompt against a local HTTP fixture.
 
 To run the upstream ACP suite with the same local fixture, install the tested revision of the kit and run the following commands. The report lists exercised and skipped requirements. [ACP compatibility kit](https://github.com/agentclientprotocol/acp-tck/tree/7c71c4d1af0994e73bdc100c9f7f6b98f2319cda)
 

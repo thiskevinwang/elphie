@@ -22,14 +22,26 @@ release = threading.Event()
 
 
 class Model(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/api/tags":
+            return self.send_error(404)
+        self.respond({"models": [{"name": "fixture"}, {"name": "orchid"}]})
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/show":
+            return self.respond({"capabilities": ["completion"]})
+        if self.path != "/api/chat":
+            return self.send_error(404)
         requests.put((self.path, body))
         prompt = body["messages"][-1]["content"]
         if prompt == "hold":
             release.wait(timeout=15)
         reply = "FIRST_REPLY" if prompt == "hello" else "NEXT_REPLY"
-        output = json.dumps({"done": True, "message": {"role": "assistant", "content": reply}}).encode()
+        self.respond({"done": True, "message": {"role": "assistant", "content": reply}})
+
+    def respond(self, value):
+        output = json.dumps(value).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(output)))
@@ -43,18 +55,22 @@ class Model(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def expect(fd, phrase):
-    output = bytearray()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if select.select([fd], [], [], 0.1)[0]:
-            block = os.read(fd, 65536)
-            if not block:
-                break
-            output.extend(block)
-            if phrase in output:
-                return
-    raise AssertionError(f"Missing {phrase!r} in terminal output: {output[-2000:]!r}")
+class TerminalOutput:
+    def __init__(self, fd):
+        self.fd = fd
+        self.buffer = bytearray()
+
+    def expect(self, phrase):
+        deadline = time.monotonic() + 10
+        while phrase not in self.buffer:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"Missing {phrase!r} in terminal output: {self.buffer[-2000:]!r}")
+            if select.select([self.fd], [], [], 0.1)[0]:
+                block = os.read(self.fd, 65536)
+                if not block:
+                    raise AssertionError(f"Terminal closed before {phrase!r}")
+                self.buffer.extend(block)
+        del self.buffer[:self.buffer.index(phrase) + len(phrase)]
 
 
 def main():
@@ -70,23 +86,44 @@ def main():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        expect(fd, b"Enter")
+        expect = TerminalOutput(fd).expect
+        expect(b"\x1b[>1u")
+        expect(b"Enter")
         os.write(fd, b"helo\x1b[Dl\r")
-        expect(fd, b"FIRST_REPLY")
+        expect(b"FIRST_REPLY")
+        expect(b"Enter")
         path, first = requests.get(timeout=5)
         assert (path, first) == ("/api/chat", {"model": "fixture", "stream": False,
                                               "messages": [{"role": "user", "content": "hello"}]})
-        os.write(fd, b"again\r")
-        expect(fd, b"NEXT_REPLY")
+        os.write(fd, b"/")
+        expect(b"Select")
+        os.write(fd, b"model")
+        expect(b"orchid")
+        os.write(fd, b"\x1b[B\r")
+        expect(b"orchid.")
+        expect(b"Enter")
+        os.write(fd, b"line one\x1b[13;2uline two\x1b\rline three\nline four!")
+        expect("!▏".encode())
+        assert requests.empty(), "A line break submitted the unfinished draft"
+        os.write(fd, b"\r")
+        expect(b"NEXT_REPLY")
+        expect(b"Enter")
         _, second = requests.get(timeout=5)
+        assert second["model"] == "orchid", second
         assert second["messages"] == [*first["messages"], {"role": "assistant", "content": "FIRST_REPLY"},
-                                      {"role": "user", "content": "again"}]
+                                      {"role": "user", "content": "line one\nline two\nline three\nline four!"}]
+        os.write(fd, b"/m\t")
+        expect(b"orchid (current)")
+        os.write(fd, b"\x1b[A\x1b")
+        expect(b"Cancelled")
         os.write(fd, b"hold\r")
-        requests.get(timeout=5)
+        _, third = requests.get(timeout=5)
+        assert third["model"] == "orchid", third
         os.write(fd, b"\x1b")
-        expect(fd, b"Cancelled")
+        expect(b"Cancelled")
         os.write(fd, b"\x03")
-        expect(fd, b"\x1b[?1049l")
+        expect(b"\x1b[<1u")
+        expect(b"\x1b[?1049l")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             child, status = os.waitpid(pid, os.WNOHANG)
@@ -102,7 +139,7 @@ def main():
                         raise
         else:
             raise AssertionError("Elphie did not exit after Ctrl+C")
-        print("Passed: terminal startup, two turns with history, cancellation, terminal restoration, clean exit.")
+        print("Passed: immediate model selection, multiline prompt, history, cancellation, terminal restoration, clean exit.")
     finally:
         release.set()
         os.close(fd)
