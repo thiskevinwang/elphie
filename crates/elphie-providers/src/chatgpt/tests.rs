@@ -1,5 +1,9 @@
 use super::*;
-use axum::{Json, Router, http::HeaderMap, routing::post};
+use axum::{
+    Json, Router,
+    http::HeaderMap,
+    routing::{get, post},
+};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -11,7 +15,7 @@ async fn sends_roles_and_model_then_returns_only_the_final_assistant_message() {
         "/",
         post(|headers: HeaderMap, Json(body): Json<Value>| async move {
             assert_eq!(headers["authorization"], "Bearer fixture-access-token");
-            assert_eq!(body["model"], "fixture");
+            assert_eq!(body["model"], "selected");
             assert_eq!(body["store"], false);
             assert_eq!(body["stream"], true);
             assert_eq!(body["input"][0]["content"], "Remember Elphie");
@@ -50,7 +54,7 @@ async fn sends_roles_and_model_then_returns_only_the_final_assistant_message() {
     let url = serve(app).await;
     let result = ChatGpt::new("fixture")
         .unwrap()
-        .request(&messages, TEST_TOKEN, &url)
+        .request("selected", &messages, TEST_TOKEN, &url)
         .await;
     assert_eq!(
         result.unwrap(),
@@ -69,7 +73,7 @@ async fn truncated_reply_does_not_complete_the_turn() {
     let url = serve(app).await;
     let err = ChatGpt::new("fixture")
         .unwrap()
-        .request(&[], TEST_TOKEN, &url)
+        .request("selected", &[], TEST_TOKEN, &url)
         .await
         .unwrap_err();
     assert!(matches!(err, ProviderError::Failed(msg) if msg.contains("disconnected")));
@@ -84,7 +88,7 @@ async fn rejected_credentials_show_sign_in_instructions() {
     let url = serve(app).await;
     let err = ChatGpt::new("fixture")
         .unwrap()
-        .request(&[], TEST_TOKEN, &url)
+        .request("selected", &[], TEST_TOKEN, &url)
         .await
         .unwrap_err();
     assert!(
@@ -102,7 +106,7 @@ async fn subscription_limit_in_the_stream_identifies_the_recipient_and_next_acti
     let url = serve(app).await;
     let error = ChatGpt::new("fixture")
         .unwrap()
-        .request(&[], TEST_TOKEN, &url)
+        .request("selected", &[], TEST_TOKEN, &url)
         .await
         .unwrap_err();
     let ProviderError::Failed(error) = error else {
@@ -145,7 +149,7 @@ async fn preserves_refusal_and_token_limited_output() {
                 .await;
         let reply = ChatGpt::new("fixture")
             .unwrap()
-            .request(&[], TEST_TOKEN, &url)
+            .request("selected", &[], TEST_TOKEN, &url)
             .await
             .unwrap();
         assert_eq!(
@@ -156,4 +160,36 @@ async fn preserves_refusal_and_token_limited_output() {
             }
         );
     }
+}
+
+#[tokio::test]
+async fn lists_visible_models_with_account_token_and_provider_order() {
+    let app = Router::new().route(
+        "/v1/models",
+        get(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer fixture-access-token");
+            Json(json!({"models": [
+                {"slug":"model-z", "display_name":"Model Z", "visibility":"list"},
+                {"slug":"private-model", "visibility":"hide"},
+                {"slug":"model-a", "display_name":"Model A", "visibility":"list"},
+                {"slug":"model-z", "display_name":"Duplicate", "visibility":"list"}
+            ]}))
+        }),
+    );
+    let url = format!("{}v1/models", serve(app).await);
+    let provider = ChatGpt::new("startup").unwrap();
+    let models = provider.catalog(TEST_TOKEN, &url).await.unwrap();
+    assert_eq!(
+        models,
+        vec![
+            ModelOption {
+                id: "model-z".into(),
+                name: "Model Z".into()
+            },
+            ModelOption {
+                id: "model-a".into(),
+                name: "Model A".into()
+            },
+        ]
+    );
 }

@@ -36,6 +36,8 @@ Start `elphie serve` as a child process. Use the same provider and model flags a
 
 To show Elphie’s icon, read `info._meta["io.github.thiskevinwang.elphie/icon"]` during initialization. The agent and terminal use this extension to send an ACP `Icon` with a 192 × 192 WebP data URI in `src`. Clients can display it offline. [ACP metadata extensions](https://agentclientprotocol.com/protocol/v2/extensibility)
 
+To enable `/model`, advertise `"elicitation": {"form": {}}` in the client capabilities. When the user sends the command, display the model choices from `elicitation/create`. Return the selected model ID in `content.model` with the `accept` action, or return `cancel` to keep the current model. [ACP form elicitation](https://agentclientprotocol.com/protocol/v2/elicitation)
+
 The server also supports listing sessions, resuming them with transcript replay, and retrying submissions with an idempotency key. Resource links enter the prompt as a name and URI. This release supports text conversations and requests no filesystem, shell, or MCP tool permissions. ACP v2 is a draft. The project pins its Rust SDK version. [ACP v2](https://agentclientprotocol.com/protocol/v2/overview) · [Rust SDK](https://agentclientprotocol.com/libraries/rust)
 
 ## Code map

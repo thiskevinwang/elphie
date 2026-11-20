@@ -35,7 +35,15 @@ pub enum ProviderError {
 
 pub type ProviderResult = Result<Completion, ProviderError>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelOption {
+    pub id: String,
+    pub name: String,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
-    async fn complete(&self, messages: &[Message]) -> ProviderResult;
+    fn default_model(&self) -> &str;
+    async fn models(&self) -> Result<Vec<ModelOption>, ProviderError>;
+    async fn complete(&self, model: &str, messages: &[Message]) -> ProviderResult;
 }

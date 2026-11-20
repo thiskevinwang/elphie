@@ -1,7 +1,7 @@
 use super::*;
 use agent_client_protocol::ByteStreams;
 use async_trait::async_trait;
-use elphie_core::{Completion, FinishReason, Message, ProviderError, ProviderResult};
+use elphie_core::{Completion, FinishReason, Message, ModelOption, ProviderError, ProviderResult};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf},
@@ -9,12 +9,29 @@ use tokio::{
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-struct TestProvider;
+type Catalog = fn() -> Result<Vec<ModelOption>, ProviderError>;
+
+struct TestProvider {
+    catalog: Catalog,
+}
 
 #[async_trait]
 impl Provider for TestProvider {
-    async fn complete(&self, messages: &[Message]) -> ProviderResult {
+    fn default_model(&self) -> &str {
+        "first"
+    }
+
+    async fn models(&self) -> Result<Vec<ModelOption>, ProviderError> {
+        (self.catalog)()
+    }
+
+    async fn complete(&self, model: &str, messages: &[Message]) -> ProviderResult {
         match messages.last().unwrap().text.as_str() {
+            "model?" => Ok(Completion {
+                text: model.into(),
+                reason: FinishReason::EndTurn,
+            }),
+            "/model" => panic!("The server must handle the model command"),
             "wait" => std::future::pending().await,
             "fail" => Err(ProviderError::Failed("Model unavailable".into())),
             "auth" => Err(ProviderError::AuthenticationRequired(
@@ -47,10 +64,25 @@ struct ClientIo {
 
 impl ClientIo {
     fn start() -> Self {
+        Self::with_catalog(|| {
+            Ok(vec![
+                ModelOption {
+                    id: "first".into(),
+                    name: "First".into(),
+                },
+                ModelOption {
+                    id: "second".into(),
+                    name: "Second".into(),
+                },
+            ])
+        })
+    }
+
+    fn with_catalog(catalog: Catalog) -> Self {
         let (client, server) = tokio::io::duplex(16384);
         let (reader, writer) = tokio::io::split(server);
         tokio::spawn(connect(
-            Arc::new(TestProvider),
+            Arc::new(TestProvider { catalog }),
             ByteStreams::new(writer.compat_write(), reader.compat()),
         ));
         let (output, input) = tokio::io::split(client);
@@ -81,10 +113,19 @@ impl ClientIo {
     }
 
     async fn session(&mut self) -> Value {
+        self.session_with_form(false).await
+    }
+
+    async fn session_with_form(&mut self, form: bool) -> Value {
+        let capabilities = if form {
+            json!({"elicitation":{"form":{}}})
+        } else {
+            json!({})
+        };
         self.send(
             Some(1),
             "initialize",
-            json!({"protocolVersion":2,"capabilities":{},"info":{"name":"test","version":"1"}}),
+            json!({"protocolVersion":2,"capabilities":capabilities,"info":{"name":"test","version":"1"}}),
         )
         .await;
         let init = self.read().await;
@@ -93,12 +134,58 @@ impl ClientIo {
         self.send(Some(2), "session/new", json!({"cwd":"/tmp"}))
             .await;
         let reply = self.read().await;
+        if form {
+            assert_eq!(reply["result"]["availableCommands"][0]["name"], "model");
+        } else {
+            assert!(reply["result"].get("availableCommands").is_none());
+        }
         assert!(reply["result"]["sessionId"].is_string());
         reply["result"]["sessionId"].clone()
     }
 
     async fn prompt(&mut self, request: u64, session: &Value, key: &str, text: &str) {
         self.send(Some(request), "session/prompt", json!({"sessionId":session,"idempotencyKey":key,"prompt":[{"type":"text","text":text}]})).await;
+    }
+
+    async fn picker(&mut self, session: &Value, key: &str) -> (Value, Value) {
+        self.prompt(5, session, key, "/model").await;
+        let message_id = self.read().await["result"]["messageId"].clone();
+        assert!(message_id.is_string());
+        assert_eq!(
+            self.update("user_message").await["content"][0]["text"],
+            "/model"
+        );
+        assert_eq!(self.update("state_update").await["state"], "running");
+        assert_eq!(
+            self.update("state_update").await["state"],
+            "requires_action"
+        );
+        let picker = self.read().await;
+        assert_eq!(picker["method"], "elicitation/create");
+        assert_eq!(picker["params"]["sessionId"], *session);
+        assert_eq!(picker["params"]["mode"], "form");
+        (message_id, picker)
+    }
+
+    async fn answer(&mut self, picker: &Value, result: Value) {
+        let frame = json!({"jsonrpc":"2.0","id":picker["id"],"result":result});
+        self.input
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn completion(&mut self, session: &Value, key: &str, prompt: &str) -> String {
+        self.prompt(10, session, key, prompt).await;
+        assert!(self.read().await["result"]["messageId"].is_string());
+        self.update("user_message").await;
+        assert_eq!(self.update("state_update").await["state"], "running");
+        let text = self.update("agent_message").await["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(self.update("state_update").await["stopReason"], "end_turn");
+        text
     }
 
     async fn update(&mut self, expected: &str) -> Value {
@@ -253,4 +340,208 @@ async fn reports_authentication_and_model_stop_reasons() {
             assert_eq!(idle["error"]["code"], -32000);
         }
     }
+}
+
+#[tokio::test]
+async fn selected_model_is_session_scoped_and_replayable() {
+    let mut client = ClientIo::start();
+    let session = client.session_with_form(true).await;
+    let (message_id, picker) = client.picker(&session, "pick").await;
+    let schema = &picker["params"]["requestedSchema"];
+    assert_eq!(schema["required"], json!(["model"]));
+    let field = &schema["properties"]["model"];
+    assert_eq!(field["type"], "string");
+    assert_eq!(field["default"], "first");
+    assert_eq!(
+        field["oneOf"],
+        json!([{"const":"first","title":"First"},{"const":"second","title":"Second"}])
+    );
+
+    client.prompt(6, &session, "pick", "/model").await;
+    assert_eq!(client.read().await["result"]["messageId"], message_id);
+    client
+        .answer(
+            &picker,
+            json!({"action":"accept","content":{"model":"second"}}),
+        )
+        .await;
+    assert_eq!(client.update("state_update").await["state"], "running");
+    let confirmation = client.update("agent_message").await;
+    assert_eq!(confirmation["content"][0]["text"], "Model set to Second.");
+    assert_eq!(confirmation["_meta"][MODEL_META_KEY], "second");
+    assert_eq!(
+        client.update("state_update").await["stopReason"],
+        "end_turn"
+    );
+    client
+        .send(Some(7), "session/close", json!({"sessionId":session}))
+        .await;
+    assert_eq!(client.read().await["result"], json!({}));
+    client
+        .send(
+            Some(8),
+            "session/resume",
+            json!({"cwd":"/tmp","sessionId":session,"replayFrom":{"type":"start"}}),
+        )
+        .await;
+    assert_eq!(client.update("user_message").await["messageId"], message_id);
+    assert_eq!(client.update("agent_message").await, confirmation);
+    client.update("replay_complete").await;
+    client.update("session_info_update").await;
+    assert_eq!(client.update("state_update").await["state"], "idle");
+    assert_eq!(
+        client.read().await["result"]["availableCommands"][0]["name"],
+        "model"
+    );
+
+    // The provider echoes its full context. Both command messages must be absent.
+    assert_eq!(client.completion(&session, "chat", "hello").await, "hello");
+    assert_eq!(
+        client.completion(&session, "model-check", "model?").await,
+        "second"
+    );
+    let (_, picker) = client.picker(&session, "check-default").await;
+    assert_eq!(
+        picker["params"]["requestedSchema"]["properties"]["model"]["default"],
+        "second"
+    );
+    client.answer(&picker, json!({"action":"decline"})).await;
+    assert_eq!(
+        client.update("state_update").await["stopReason"],
+        "end_turn"
+    );
+    client
+        .send(Some(9), "session/new", json!({"cwd":"/tmp"}))
+        .await;
+    let other = client.read().await["result"]["sessionId"].clone();
+    assert_eq!(
+        client.completion(&other, "model-check", "model?").await,
+        "first"
+    );
+}
+
+#[tokio::test]
+async fn invalid_and_cancelled_selections_keep_the_previous_model() {
+    let mut client = ClientIo::start();
+    let session = client.session_with_form(true).await;
+    for result in [
+        json!({"action":"accept","content":{"model":"missing"}}),
+        json!({"action":"accept"}),
+    ] {
+        let (_, picker) = client.picker(&session, &result.to_string()).await;
+        client.answer(&picker, result).await;
+        let state = client.update("state_update").await;
+        assert_eq!(state["state"], "idle");
+        assert_eq!(state["error"]["code"], -32602);
+    }
+    let (_, picker) = client.picker(&session, "cancel-form").await;
+    client.answer(&picker, json!({"action":"cancel"})).await;
+    assert_eq!(
+        client.update("state_update").await["stopReason"],
+        "cancelled"
+    );
+
+    let (_, picker) = client.picker(&session, "cancel-session").await;
+    client
+        .send(None, "session/cancel", json!({"sessionId":session}))
+        .await;
+    let cancel = client.read().await;
+    assert_eq!(cancel["method"], "$/cancel_request");
+    assert_eq!(cancel["params"]["requestId"], picker["id"]);
+    assert_eq!(
+        client.update("state_update").await["stopReason"],
+        "cancelled"
+    );
+    client
+        .answer(
+            &picker,
+            json!({"action":"accept","content":{"model":"second"}}),
+        )
+        .await;
+    assert_eq!(
+        client.completion(&session, "model-check", "model?").await,
+        "first"
+    );
+}
+
+#[tokio::test]
+async fn model_command_explains_missing_form_support() {
+    let mut client = ClientIo::start();
+    let session = client.session().await;
+    assert!(
+        client
+            .completion(&session, "pick", "/model")
+            .await
+            .contains("form support")
+    );
+    assert_eq!(client.completion(&session, "chat", "hello").await, "hello");
+    assert!(
+        client
+            .completion(&session, "space", "/model \n")
+            .await
+            .contains("form support")
+    );
+    assert!(
+        client
+            .completion(&session, "literal", "/model comparison")
+            .await
+            .ends_with("/model comparison")
+    );
+}
+
+#[tokio::test]
+async fn catalog_failures_end_the_command_and_allow_the_next_prompt() {
+    let empty: Catalog = || Ok(vec![]);
+    let offline: Catalog = || {
+        Err(ProviderError::AuthenticationRequired(
+            "Sign in first".into(),
+        ))
+    };
+    for (catalog, code) in [(empty, -32603), (offline, -32000)] {
+        let mut client = ClientIo::with_catalog(catalog);
+        let session = client.session_with_form(true).await;
+        client.prompt(5, &session, "pick", "/model").await;
+        assert!(client.read().await["result"]["messageId"].is_string());
+        client.update("user_message").await;
+        assert_eq!(client.update("state_update").await["state"], "running");
+        let idle = client.update("state_update").await;
+        assert_eq!(idle["state"], "idle");
+        assert_eq!(idle["error"]["code"], code);
+        assert_eq!(client.completion(&session, "chat", "hello").await, "hello");
+    }
+}
+
+#[tokio::test]
+async fn queued_prompt_uses_the_model_chosen_from_a_changed_catalog() {
+    let mut client = ClientIo::with_catalog(|| {
+        Ok(vec![ModelOption {
+            id: "new".into(),
+            name: "New".into(),
+        }])
+    });
+    let session = client.session_with_form(true).await;
+    let (_, picker) = client.picker(&session, "pick").await;
+    assert!(
+        picker["params"]["requestedSchema"]["properties"]["model"]
+            .get("default")
+            .is_none()
+    );
+    client.prompt(5, &session, "queued", "model?").await;
+    client
+        .answer(
+            &picker,
+            json!({"action":"accept","content":{"model":"new"}}),
+        )
+        .await;
+    assert_eq!(client.update("state_update").await["state"], "running");
+    client.update("agent_message").await;
+    assert_eq!(client.update("state_update").await["state"], "idle");
+    assert!(client.read().await["result"]["messageId"].is_string());
+    client.update("user_message").await;
+    assert_eq!(client.update("state_update").await["state"], "running");
+    assert_eq!(
+        client.update("agent_message").await["content"][0]["text"],
+        "new"
+    );
+    assert_eq!(client.update("state_update").await["state"], "idle");
 }

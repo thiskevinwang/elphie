@@ -1,4 +1,5 @@
 mod metadata;
+mod model;
 mod session;
 
 pub use metadata::implementation;
@@ -6,7 +7,10 @@ pub use metadata::implementation;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use agent_client_protocol::{
@@ -18,6 +22,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use session::{Command, Session};
+
+/// The selected model ID in a successful, replayable ACP agent message.
+pub const MODEL_META_KEY: &str = "io.github.thiskevinwang.elphie/model";
 
 pub async fn serve(provider: Arc<dyn Provider>) -> anyhow::Result<()> {
     Ok(connect(provider, Stdio::new()).await?)
@@ -48,11 +55,19 @@ async fn connect(
     transport: impl ConnectTo<Agent>,
 ) -> agent_client_protocol::Result<()> {
     let sessions = Sessions::default();
+    let supports_form = AtomicBool::new(false);
     Agent
         .v2()
         .name("Elphie")
         .on_receive_request(
-            async |_: schema::InitializeRequest, response, _| {
+            async |request: schema::InitializeRequest, response, _| {
+                supports_form.store(
+                    request
+                        .capabilities
+                        .elicitation
+                        .is_some_and(|e| e.form.is_some()),
+                    Ordering::Relaxed,
+                );
                 response.respond(
                     schema::InitializeResponse::new(
                         ProtocolVersion::V2,
@@ -75,11 +90,13 @@ async fn connect(
                 }
                 let id = schema::SessionId::new(Uuid::new_v4().to_string());
                 let (tx, rx) = mpsc::unbounded_channel();
+                let form = supports_form.load(Ordering::Relaxed);
                 let session = Session::new(
                     id.clone(),
                     request.cwd.clone(),
                     provider.clone(),
                     connection.clone(),
+                    form,
                 );
                 connection.spawn(session.run(rx))?;
                 sessions.0.lock().unwrap().insert(
@@ -89,7 +106,9 @@ async fn connect(
                         commands: tx,
                     },
                 );
-                response.respond(schema::NewSessionResponse::new(id))
+                response.respond(
+                    schema::NewSessionResponse::new(id).available_commands(model::commands(form)),
+                )
             },
             on_receive_request!(),
         )

@@ -1,21 +1,22 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use async_trait::async_trait;
 use elphie_core::{
-    Completion, FinishReason, Message, Provider, ProviderError, ProviderResult, Role,
+    Completion, FinishReason, Message, ModelOption, Provider, ProviderError, ProviderResult, Role,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode, redirect::Policy};
+use reqwest::{Client, Response as HttpResponse, StatusCode, redirect::Policy};
 use serde::Deserialize;
 use serde_json::json;
 
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
+const MODELS_ENDPOINT: &str = "https://api.openai.com/v1/models";
 const LOGIN: &str = "Sign in again with elphie login.";
 
 pub struct ChatGpt {
     client: Client,
-    model: String,
+    default_model: String,
 }
 
 impl ChatGpt {
@@ -30,10 +31,64 @@ impl ChatGpt {
             .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { client, model })
+        Ok(Self {
+            client,
+            default_model: model,
+        })
     }
 
-    async fn request(&self, messages: &[Message], token: &str, url: &str) -> ProviderResult {
+    async fn catalog(&self, token: &str, url: &str) -> Result<Vec<ModelOption>, ProviderError> {
+        #[derive(Deserialize)]
+        struct Catalog {
+            models: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            visibility: Option<String>,
+            slug: Option<String>,
+            display_name: Option<String>,
+        }
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Failed(format!("Cannot list ChatGPT models: {e}")))?;
+        let (response, _) = checked_response(response).await?;
+        let catalog: Catalog = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Failed(format!("Invalid ChatGPT model list: {e}")))?;
+        let mut seen = HashSet::new();
+        Ok(catalog
+            .models
+            .into_iter()
+            .filter_map(|entry| {
+                let id = entry.slug?;
+                if entry.visibility.as_deref() != Some("list")
+                    || id.trim().is_empty()
+                    || !seen.insert(id.clone())
+                {
+                    return None;
+                }
+                let name = entry
+                    .display_name
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| id.clone());
+                Some(ModelOption { id, name })
+            })
+            .collect())
+    }
+
+    async fn request(
+        &self,
+        model: &str,
+        messages: &[Message],
+        token: &str,
+        url: &str,
+    ) -> ProviderResult {
         let input: Vec<_> = messages
             .iter()
             .map(|message| {
@@ -50,28 +105,13 @@ impl ChatGpt {
             .bearer_auth(token)
             .header("accept", "text/event-stream")
             .json(&json!({
-                "model": self.model, "store": false, "stream": true,
+                "model": model, "store": false, "stream": true,
                 "input": input
             }))
             .send()
             .await
             .map_err(|e| ProviderError::Failed(format!("ChatGPT request failed. {e}")))?;
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|id| id.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        if !status.is_success() {
-            let body = response.json::<Failure>().await.unwrap_or_default();
-            let message = failure_message(Some(status), &body, &request_id);
-            return Err(if status == StatusCode::UNAUTHORIZED {
-                ProviderError::AuthenticationRequired(message)
-            } else {
-                ProviderError::Failed(message)
-            });
-        }
+        let (response, request_id) = checked_response(response).await?;
         let mut events = response.bytes_stream().eventsource();
         let mut items = Vec::new();
         while let Some(event) = events.next().await {
@@ -127,16 +167,48 @@ impl ChatGpt {
 
 #[async_trait]
 impl Provider for ChatGpt {
-    async fn complete(&self, messages: &[Message]) -> ProviderResult {
-        let token = elphie_signin::access_token().await.map_err(|error| {
-            if error.is::<elphie_signin::AuthenticationRequired>() {
-                ProviderError::AuthenticationRequired(error.to_string())
-            } else {
-                ProviderError::Failed(error.to_string())
-            }
-        })?;
-        self.request(messages, &token, ENDPOINT).await
+    fn default_model(&self) -> &str {
+        &self.default_model
     }
+
+    async fn models(&self) -> Result<Vec<ModelOption>, ProviderError> {
+        self.catalog(&access_token().await?, MODELS_ENDPOINT).await
+    }
+
+    async fn complete(&self, model: &str, messages: &[Message]) -> ProviderResult {
+        self.request(model, messages, &access_token().await?, ENDPOINT)
+            .await
+    }
+}
+
+async fn access_token() -> Result<String, ProviderError> {
+    elphie_signin::access_token().await.map_err(|error| {
+        if error.is::<elphie_signin::AuthenticationRequired>() {
+            ProviderError::AuthenticationRequired(error.to_string())
+        } else {
+            ProviderError::Failed(error.to_string())
+        }
+    })
+}
+
+async fn checked_response(response: HttpResponse) -> Result<(HttpResponse, String), ProviderError> {
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|id| id.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    if status.is_success() {
+        return Ok((response, request_id));
+    }
+    let body = response.json::<Failure>().await.unwrap_or_default();
+    let message = failure_message(Some(status), &body, &request_id);
+    Err(if status == StatusCode::UNAUTHORIZED {
+        ProviderError::AuthenticationRequired(message)
+    } else {
+        ProviderError::Failed(message)
+    })
 }
 
 #[derive(Deserialize)]
@@ -197,7 +269,7 @@ fn failure_message(status: Option<StatusCode>, failure: &Failure, request_id: &s
         (_, Some(StatusCode::TOO_MANY_REQUESTS)) => {
             "ChatGPT request limit reached. Try again later."
         }
-        _ => "ChatGPT could not complete the reply.",
+        _ => "ChatGPT could not complete the request.",
     };
     let mut details = Vec::new();
     if let Some(status) = status {
