@@ -1,5 +1,6 @@
 """Exercise the built terminal and server with a local Ollama fixture on Unix."""
 
+import errno
 import fcntl
 import http.server
 import json
@@ -93,16 +94,21 @@ def main():
                 pid = None
                 assert os.waitstatus_to_exitcode(status) == 0, status
                 break
-            time.sleep(0.05)
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    os.read(fd, 65536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
         else:
             raise AssertionError("Elphie did not exit after Ctrl+C")
         print("Passed: terminal startup, two turns with history, cancellation, terminal restoration, clean exit.")
     finally:
         release.set()
+        os.close(fd)
         if pid:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
-        os.close(fd)
         server.shutdown()
         server.server_close()
 
