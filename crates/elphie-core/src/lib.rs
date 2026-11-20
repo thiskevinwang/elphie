@@ -1,5 +1,12 @@
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::Value;
+
+/// Offline icon supplied when Elphie identifies itself to ACP or MCP peers.
+pub fn icon_data_uri() -> String {
+    let image = STANDARD.encode(include_bytes!("../assets/elphie.webp"));
+    format!("data:image/webp;base64,{image}")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {

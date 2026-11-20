@@ -32,8 +32,10 @@ For a Client ID Metadata Document (CIMD), host your JSON at an HTTPS URL. Set `c
 }
 ```
 
-To show Elphie’s icon during authorization, host the [Elphie image](../elphie-acp/assets/elphie.webp) with your document and set `logo_uri` to its HTTPS URL.
+To show Elphie’s icon during authorization, host the [Elphie image](../elphie-core/assets/elphie.webp) with your document and set `logo_uri` to its HTTPS URL.
 
 The resource must publish MCP protected resource metadata. Its authorization server must advertise S256 PKCE. If it supports CIMD, rmcp sends the document URL as the client ID. Otherwise rmcp attempts dynamic registration. Use `ClientIdentity::Dynamic` to start without a document. For an existing public client, pass `ClientIdentity::Preregistered { issuer, client_id }`.
 
 This flow authorizes access to the selected MCP resource. ChatGPT sign-in belongs to the model provider. [MCP client registration](https://modelcontextprotocol.io/specification/draft/basic/authorization/client-registration)
+
+To use this grant with Elphie’s MCP client, call `pending.finish_resource(callback).await?`. Pass the returned grant and the HTTP server configuration to `elphie_mcp::McpClient::connect_authorized(&server, grant).await?`. The client verifies the resource URL before sending a token.

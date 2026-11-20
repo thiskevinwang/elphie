@@ -17,6 +17,19 @@ pub enum ClientIdentity {
 pub struct PendingAuthorization {
     session: AuthorizationSession,
     redirect: Url,
+    resource: Url,
+}
+
+/// A completed authorization and the exact MCP endpoint the host selected.
+pub struct AuthorizedResource {
+    resource: Url,
+    manager: AuthorizationManager,
+}
+
+impl AuthorizedResource {
+    pub fn into_parts(self) -> (Url, AuthorizationManager) {
+        (self.resource, self.manager)
+    }
 }
 
 impl PendingAuthorization {
@@ -54,7 +67,7 @@ impl PendingAuthorization {
         };
 
         let allow_loopback = is_loopback(&resource);
-        let mut manager = AuthorizationManager::new(resource).await?;
+        let mut manager = AuthorizationManager::new(resource.clone()).await?;
         let resolution = manager.resolve_metadata().await?;
         ensure!(
             matches!(
@@ -95,7 +108,11 @@ impl PendingAuthorization {
         let session = AuthorizationSession::new(manager, request)
             .await
             .map_err(|(_, error)| error)?;
-        Ok(Self { session, redirect })
+        Ok(Self {
+            session,
+            redirect,
+            resource,
+        })
     }
 
     pub fn authorization_url(&self) -> &str {
@@ -103,6 +120,10 @@ impl PendingAuthorization {
     }
 
     pub async fn finish(self, callback: Url) -> Result<AuthorizationManager> {
+        Ok(self.finish_resource(callback).await?.manager)
+    }
+
+    pub async fn finish_resource(self, callback: Url) -> Result<AuthorizedResource> {
         let mut destination = callback.clone();
         destination.set_query(None);
         ensure!(
@@ -120,7 +141,10 @@ impl PendingAuthorization {
         }
         ensure!(!seen.contains("error"), "authorization declined or failed");
         self.session.handle_callback_url(callback.as_str()).await?;
-        Ok(self.session.auth_manager)
+        Ok(AuthorizedResource {
+            resource: self.resource,
+            manager: self.session.auth_manager,
+        })
     }
 }
 

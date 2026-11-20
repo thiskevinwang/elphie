@@ -1,6 +1,6 @@
 # Elphie
 
-<img src="crates/elphie-acp/assets/elphie.webp" width="96" height="96" alt="Elphie, a black and white cat">
+<img src="crates/elphie-core/assets/elphie.webp" width="96" height="96" alt="Elphie, a black and white cat">
 
 Elphie is a text chat agent written in Rust. The terminal opens a conversation with an Elphie server over standard input and output. A desktop client can start the same server and use the same ACP v2 messages.
 

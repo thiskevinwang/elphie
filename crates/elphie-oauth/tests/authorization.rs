@@ -81,7 +81,12 @@ async fn exchanges_cimd_code_with_matching_pkce_verifier_and_resource() {
         .query_pairs_mut()
         .append_pair("code", "example-code")
         .append_pair("state", &query["state"]);
-    let manager = pending.finish(callback).await.unwrap();
+    let (resource, manager) = pending
+        .finish_resource(callback)
+        .await
+        .unwrap()
+        .into_parts();
+    assert_eq!(resource, server.resource);
     assert_eq!(
         manager.get_access_token().await.unwrap(),
         "example-access-token"
