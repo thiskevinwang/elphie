@@ -1,12 +1,35 @@
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::v2::{ConnectionTo, Responder, schema};
 use agent_client_protocol::{AcpAgent, Agent, Client, Error};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::view_model::{Action, Edit, Event, ModelChoice, Phase};
 use elphie_core::{ModelOption, Role};
+use elphie_view_model::{Action, Edit, Event, FormId, ModelChoice, Phase};
+
+#[derive(Default)]
+struct PendingForms {
+    next_id: FormId,
+    replies: HashMap<FormId, oneshot::Sender<ModelChoice>>,
+}
+
+impl PendingForms {
+    fn open(&mut self) -> (FormId, oneshot::Receiver<ModelChoice>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (reply, selection) = oneshot::channel();
+        self.replies.insert(id, reply);
+        (id, selection)
+    }
+
+    fn answer(&mut self, id: FormId, choice: ModelChoice) {
+        if let Some(reply) = self.replies.remove(&id) {
+            let _ = reply.send(choice);
+        }
+    }
+}
 
 pub async fn run(
     agent: AcpAgent,
@@ -14,7 +37,9 @@ pub async fn run(
     events: UnboundedSender<Event>,
 ) -> anyhow::Result<()> {
     let updates = events.clone();
-    let forms = events.clone();
+    let form_events = events.clone();
+    let pending_forms = Arc::new(Mutex::new(PendingForms::default()));
+    let incoming_forms = Arc::clone(&pending_forms);
     Client
         .v2()
         .name("Elphie terminal")
@@ -39,7 +64,12 @@ pub async fn run(
             async move |request: schema::CreateElicitationRequest,
                         responder: Responder<schema::CreateElicitationResponse>,
                         connection: ConnectionTo<Agent>| {
-                connection.spawn(choose_model(request, responder, forms.clone()))
+                connection.spawn(choose_model(
+                    request,
+                    responder,
+                    form_events.clone(),
+                    Arc::clone(&incoming_forms),
+                ))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -86,8 +116,12 @@ pub async fn run(
                             session.session_id().clone(),
                         ))?;
                     }
+                    Action::AnswerModel(id, choice) => {
+                        pending_forms.lock().unwrap().answer(id, choice)
+                    }
                 }
             }
+            pending_forms.lock().unwrap().replies.clear();
             session.close().block_task().await?;
             Ok(())
         })
@@ -99,6 +133,7 @@ async fn choose_model(
     request: schema::CreateElicitationRequest,
     responder: Responder<schema::CreateElicitationResponse>,
     events: UnboundedSender<Event>,
+    pending_forms: Arc<Mutex<PendingForms>>,
 ) -> agent_client_protocol::Result<()> {
     use schema::{CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction};
     let schema::ElicitationMode::Form(form) = request.mode else {
@@ -108,19 +143,24 @@ async fn choose_model(
         Ok(options) => options,
         Err(error) => return responder.respond_with_error(error),
     };
-    let request_id = responder.id().clone();
-    let (reply, selection) = oneshot::channel();
-    let _ = events.send(Event::ChooseModel {
-        request_id: request_id.clone(),
-        message: request.message,
-        current,
-        models,
-        reply,
-    });
+    let (request_id, selection) = pending_forms.lock().unwrap().open();
+    if events
+        .send(Event::ChooseModel {
+            request_id,
+            message: request.message,
+            current,
+            models,
+        })
+        .is_err()
+    {
+        pending_forms.lock().unwrap().replies.remove(&request_id);
+        return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+    }
     let cancellation = responder.cancellation();
     let selected = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
+            pending_forms.lock().unwrap().replies.remove(&request_id);
             let _ = events.send(Event::DismissModel(request_id));
             ModelChoice::Cancel
         }
@@ -228,6 +268,28 @@ fn project(update: schema::SessionUpdate) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_late_picker_answer_cannot_complete_another_request() {
+        let mut forms = PendingForms::default();
+        let (first, mut first_answer) = forms.open();
+        let (second, mut second_answer) = forms.open();
+        forms.replies.remove(&first);
+        forms.answer(first, ModelChoice::Select("stale".into()));
+        assert_eq!(
+            first_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+        assert_eq!(
+            second_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        forms.answer(second, ModelChoice::Select("chosen".into()));
+        assert_eq!(
+            second_answer.try_recv().unwrap(),
+            ModelChoice::Select("chosen".into())
+        );
+    }
 
     #[test]
     fn model_form_accepts_plain_enum_and_rejects_conflicting_or_unsupported_fields() {

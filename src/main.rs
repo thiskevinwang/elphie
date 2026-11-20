@@ -1,6 +1,5 @@
 mod client;
 mod terminal;
-mod view_model;
 
 use std::sync::Arc;
 

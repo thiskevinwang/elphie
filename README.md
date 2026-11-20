@@ -22,9 +22,11 @@ The default model is `gpt-6.1-sol`. Use `elphie --model <model>` to select anoth
 elphie --provider ollama --model llama3.2
 ```
 
-Type `/model` to open the model picker immediately. You can also type `/` and press Tab. Use ↑ or ↓ to highlight a model from the current provider. Press Enter to select it or Esc to keep the current model. The next message uses that model with the same conversation history. Each session has its own selection.
+Type `/model` to open the model picker immediately. Press `/` in the picker to search by model name or ID. Use ↑ or ↓ to highlight a match, then press Enter to select it. Esc clears the search and Esc again closes the picker. The next message uses the selected model with the same conversation history.
 
 Press Shift+Enter to add a line. If your terminal sends the same key code for Enter and Shift+Enter, use Ctrl+J or Alt+Enter. Press Enter to send the whole message. Esc cancels the current turn, Page Up and Page Down scroll the conversation, and Ctrl+C quits. Each response appears when the provider finishes. Conversation history stays in the server process until it exits.
+
+With an empty draft, press ↑ to recall a prompt from this session or `?` to show keyboard shortcuts. Press `?` again to start a message with a question mark. You can edit a recalled prompt before sending it. In a multiline draft, ↑ and ↓ move between lines.
 
 ## Connect a desktop client
 
@@ -46,9 +48,10 @@ The server also supports listing sessions, resuming them with transcript replay,
 
 | Component | Responsibility |
 | --- | --- |
-| `src/terminal.rs` | Draw the terminal and capture keyboard input. |
-| `src/view_model.rs` | Manage the draft, message edits, and turn status independently of the terminal. |
-| `src/client.rs` | Convert UI actions to ACP requests and ACP updates to view-model events. |
+| `src/terminal.rs` | Translate terminal input into user intents and send the resulting actions to the client. |
+| `src/terminal/view.rs` | Draw the transcript, composer, picker, and shortcuts for the available screen size. |
+| `elphie-view-model` | Apply user intents and agent events to the draft, prompt history, transcript, and picker. |
+| `src/client.rs` | Send actions over ACP and translate replies into view-model events. Own pending form replies. |
 | `elphie-core` | Define provider-independent messages and the provider interface. |
 | `elphie-acp` | Own session history, prompt ordering, cancellation, and replay. |
 | `elphie-providers` | Send conversation history to ChatGPT or Ollama. |
@@ -56,6 +59,8 @@ The server also supports listing sessions, resuming them with transcript replay,
 | `elphie-oauth` | Authorize a host to access an MCP resource with the official Rust MCP SDK. |
 
 To add a model provider, implement `elphie_core::Provider` and select the implementation in `src/main.rs`. The terminal and ACP session code use the same interface for both providers.
+
+For example, when the user presses Enter in the picker, the terminal sends a submit intent to the view model. The view model returns the selected model ID and form ID. The client answers the ACP request. The displayed model changes when the server confirms the selection. A desktop host can drive the same Rust view model through its public intents and events.
 
 For MCP authorization, supply the URL of a hosted Client ID Metadata Document (CIMD), use dynamic registration, or use an existing public client registration. The host supplies the browser and callback listener. The library returns an authorized rmcp manager. [MCP sign-in example](crates/elphie-oauth/README.md)
 
@@ -68,7 +73,7 @@ cargo build --locked
 python3 tests/terminal.py
 ```
 
-The last check needs a Unix pseudo-terminal. It opens the picker by typing `/model`, sends a multiline message to the selected model, checks the conversation history, and cancels both a selection and a prompt against a local HTTP fixture.
+The last check needs a Unix pseudo-terminal. It exercises shortcuts, model filtering, terminal resize, prompt recall, and cancellation. A local HTTP fixture checks which model received the messages and their conversation history.
 
 To run the upstream ACP suite with the same local fixture, install the tested revision of the kit and run the following commands. The report lists exercised and skipped requirements. [ACP compatibility kit](https://github.com/agentclientprotocol/acp-tck/tree/7c71c4d1af0994e73bdc100c9f7f6b98f2319cda)
 

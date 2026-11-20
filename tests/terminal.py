@@ -1,5 +1,6 @@
 """Exercise the built terminal and server with a local Ollama fixture on Unix."""
 
+import codecs
 import errno
 import fcntl
 import http.server
@@ -8,6 +9,7 @@ import os
 import pathlib
 import pty
 import queue
+import re
 import select
 import signal
 import struct
@@ -15,6 +17,7 @@ import sys
 import termios
 import threading
 import time
+import unicodedata
 
 
 requests = queue.Queue()
@@ -56,21 +59,70 @@ class Model(http.server.BaseHTTPRequestHandler):
 
 
 class TerminalOutput:
+    # Ratatui sends cell edits with absolute cursor positions. Reassemble those
+    # edits so a wait observes the visible screen, even across partial writes.
+    csi = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+
     def __init__(self, fd):
         self.fd = fd
-        self.buffer = bytearray()
+        self.decoder = codecs.getincrementaldecoder("utf8")()
+        self.pending = ""
+        self.controls = set()
+        self.resize(30, 90)
 
-    def expect(self, phrase):
+    def resize(self, height, width):
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        self.height, self.width = height, width
+        self.clear()
+
+    def clear(self):
+        self.cells = [[" "] * self.width for _ in range(self.height)]
+        self.row = self.col = 0
+
+    def feed(self, block):
+        s = self.pending + self.decoder.decode(block)
+        i = 0
+        while i < len(s):
+            if s[i] == "\x1b":
+                command = self.csi.match(s, i)
+                if not command:
+                    break
+                args, _, op = command.groups()
+                if op in "Hf":
+                    row, _, col = args.partition(";")
+                    self.row, self.col = int(row or 1) - 1, int(col or 1) - 1
+                elif op == "J" and args == "2":
+                    self.clear()
+                elif command[0] in ("\x1b[>1u", "\x1b[<1u", "\x1b[?1049l"):
+                    self.controls.add(command[0])
+                i = command.end()
+                continue
+            ch = s[i]
+            if ch == "\r":
+                self.col = 0
+            elif ch == "\n":
+                self.row += 1
+            elif ch >= " ":
+                if 0 <= self.row < self.height and 0 <= self.col < self.width:
+                    self.cells[self.row][self.col] = ch
+                self.col += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            i += 1
+        self.pending = s[i:]
+
+    def expect(self, *present, absent=()):
         deadline = time.monotonic() + 10
-        while phrase not in self.buffer:
-            if time.monotonic() >= deadline:
-                raise AssertionError(f"Missing {phrase!r} in terminal output: {self.buffer[-2000:]!r}")
-            if select.select([self.fd], [], [], 0.1)[0]:
-                block = os.read(self.fd, 65536)
-                if not block:
-                    raise AssertionError(f"Terminal closed before {phrase!r}")
-                self.buffer.extend(block)
-        del self.buffer[:self.buffer.index(phrase) + len(phrase)]
+        while True:
+            screen = "\n".join("".join(row).rstrip() for row in self.cells)
+            if all(text in screen or text in self.controls for text in present) and all(
+                    text not in screen for text in absent):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.fd], [], [], remaining)[0]:
+                raise AssertionError(f"Expected {present!r}, absent {absent!r}. Screen:\n{screen}")
+            block = os.read(self.fd, 65536)
+            if not block:
+                raise AssertionError("Terminal closed before the expected screen appeared")
+            self.feed(block)
 
 
 def main():
@@ -86,44 +138,67 @@ def main():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        expect = TerminalOutput(fd).expect
-        expect(b"\x1b[>1u")
-        expect(b"Enter")
+        output = TerminalOutput(fd)
+        expect = output.expect
+        expect("\x1b[>1u", "Elphie", "fixture", "Ask Elphie", "? for shortcuts")
+
+        os.write(fd, b"?")
+        expect("Keyboard shortcuts", "Shift+Enter")
+        os.write(fd, b"\x1b")
+        expect("? for shortcuts", absent=("Keyboard shortcuts",))
         os.write(fd, b"helo\x1b[Dl\r")
-        expect(b"FIRST_REPLY")
-        expect(b"Enter")
+        expect("FIRST_REPLY", "? for shortcuts")
         path, first = requests.get(timeout=5)
         assert (path, first) == ("/api/chat", {"model": "fixture", "stream": False,
                                               "messages": [{"role": "user", "content": "hello"}]})
+
         os.write(fd, b"/")
-        expect(b"Select")
+        expect("/model", "Select")
         os.write(fd, b"model")
-        expect(b"orchid")
-        os.write(fd, b"\x1b[B\r")
-        expect(b"orchid.")
-        expect(b"Enter")
+        expect("Select a model", "fixture (current)", "orchid")
+        os.write(fd, b"/absent\r")
+        expect("No matching models")
+        os.write(fd, b"\x1b")
+        expect("fixture (current)", "orchid", absent=("No matching models",))
+        os.write(fd, b"/OrC")
+        expect("OrC", "orchid", absent=("fixture (current)",))
+        output.resize(9, 36)
+        expect("OrC", "orchid")
+        output.resize(30, 90)
+        expect("OrC", "orchid", absent=("fixture (current)",))
+        os.write(fd, b"\r")
+        expect("orchid.", "? for shortcuts")
+
         os.write(fd, b"line one\x1b[13;2uline two\x1b\rline three\nline four!")
-        expect("!▏".encode())
+        expect("line one", "line two", "line three", "line four!▏")
         assert requests.empty(), "A line break submitted the unfinished draft"
         os.write(fd, b"\r")
-        expect(b"NEXT_REPLY")
-        expect(b"Enter")
+        expect("NEXT_REPLY", "? for shortcuts")
         _, second = requests.get(timeout=5)
+        multiline = "line one\nline two\nline three\nline four!"
         assert second["model"] == "orchid", second
         assert second["messages"] == [*first["messages"], {"role": "assistant", "content": "FIRST_REPLY"},
-                                      {"role": "user", "content": "line one\nline two\nline three\nline four!"}]
+                                      {"role": "user", "content": multiline}]
+
+        os.write(fd, b"\x1b[A")
+        expect("line four!▏")
+        os.write(fd, b"?\r")
+        _, recalled = requests.get(timeout=5)
+        assert recalled["messages"] == [*second["messages"], {"role": "assistant", "content": "NEXT_REPLY"},
+                                        {"role": "user", "content": multiline + "?"}]
+        expect("line four!?", "? for shortcuts")
         os.write(fd, b"/m\t")
-        expect(b"orchid (current)")
+        expect("orchid (current)")
         os.write(fd, b"\x1b[A\x1b")
-        expect(b"Cancelled")
+        expect("Cancelled")
         os.write(fd, b"hold\r")
-        _, third = requests.get(timeout=5)
-        assert third["model"] == "orchid", third
+        _, held = requests.get(timeout=5)
+        assert held["model"] == "orchid" and held["messages"][-1]["content"] == "hold", held
+        expect("Working", absent=("Cancelled",))
         os.write(fd, b"\x1b")
-        expect(b"Cancelled")
+        expect("Cancelled")
         os.write(fd, b"\x03")
-        expect(b"\x1b[<1u")
-        expect(b"\x1b[?1049l")
+        expect("\x1b[<1u", "\x1b[?1049l")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             child, status = os.waitpid(pid, os.WNOHANG)
@@ -139,7 +214,7 @@ def main():
                         raise
         else:
             raise AssertionError("Elphie did not exit after Ctrl+C")
-        print("Passed: immediate model selection, multiline prompt, history, cancellation, terminal restoration, clean exit.")
+        print("Passed: shortcuts, model search and selection, resize, multiline recall, cancellation, clean exit.")
     finally:
         release.set()
         os.close(fd)
