@@ -774,6 +774,7 @@ name = "elphie-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -805,6 +806,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

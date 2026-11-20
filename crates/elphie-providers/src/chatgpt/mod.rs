@@ -1,18 +1,21 @@
 use std::{collections::HashSet, time::Duration};
 
+use crate::{text_history, text_message, text_reply, validate_calls};
 use async_trait::async_trait;
 use elphie_core::{
-    Completion, FinishReason, Message, ModelOption, Provider, ProviderError, ProviderResult, Role,
+    Completion, FinishReason, Message, ModelInput, ModelOption, ModelTurn, Provider, ProviderError,
+    ProviderResult, ToolCall, ToolDefinition, ToolRequest,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{Client, Response as HttpResponse, StatusCode, redirect::Policy};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MODELS_ENDPOINT: &str = "https://api.openai.com/v1/models";
 const LOGIN: &str = "Sign in again with elphie login.";
+const TOOL_NAMESPACE: &str = "workspace";
 
 pub struct ChatGpt {
     client: Client,
@@ -89,25 +92,59 @@ impl ChatGpt {
         token: &str,
         url: &str,
     ) -> ProviderResult {
-        let input: Vec<_> = messages
-            .iter()
-            .map(|message| {
-                let role = match message.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                };
-                json!({ "role": role, "content": message.text })
-            })
-            .collect();
+        text_reply(
+            self.request_turn(model, &text_history(messages), &[], token, url)
+                .await?,
+        )
+    }
+
+    async fn request_turn(
+        &self,
+        model: &str,
+        history: &[ModelInput],
+        tools: &[ToolDefinition],
+        token: &str,
+        url: &str,
+    ) -> Result<ModelTurn, ProviderError> {
+        let mut input = Vec::new();
+        for item in history {
+            match item {
+                ModelInput::Message(message) => input.push(text_message(message)),
+                ModelInput::Tools { request, outputs } => {
+                    let items = request.continuation.as_array().ok_or_else(|| {
+                        ProviderError::Failed("Missing ChatGPT tool call history.".into())
+                    })?;
+                    input.extend(items.iter().cloned());
+                    for (call, output) in request.results(outputs)? {
+                        input.push(json!({
+                            "type": "function_call_output", "call_id": call.id, "output": output
+                        }));
+                    }
+                }
+            }
+        }
+        let mut body = json!({"model": model, "store": false, "stream": true, "input": input});
+        if !tools.is_empty() {
+            let functions: Vec<_> = tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function", "name": tool.name,
+                        "description": tool.description, "parameters": tool.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = json!([{
+                "type": "namespace", "name": TOOL_NAMESPACE,
+                "description": "Work with the current workspace.", "tools": functions
+            }]);
+        }
         let response = self
             .client
             .post(url)
             .bearer_auth(token)
             .header("accept", "text/event-stream")
-            .json(&json!({
-                "model": model, "store": false, "stream": true,
-                "input": input
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Failed(format!("ChatGPT request failed. {e}")))?;
@@ -124,9 +161,11 @@ impl ChatGpt {
             let event: ReplyEvent = serde_json::from_str(&data)
                 .map_err(|_| ProviderError::Failed("Invalid ChatGPT response event.".into()))?;
             match event {
-                ReplyEvent::ItemDone { item } => items.push(item),
+                ReplyEvent::ItemDone { item, output_index } => {
+                    items.push((output_index.unwrap_or(items.len()), item));
+                }
                 ReplyEvent::Completed { response } => {
-                    return response.completion(items, FinishReason::EndTurn);
+                    return response.turn(items, FinishReason::EndTurn, !tools.is_empty());
                 }
                 ReplyEvent::Incomplete { response } => {
                     if response
@@ -134,7 +173,7 @@ impl ChatGpt {
                         .as_ref()
                         .is_some_and(|detail| detail.reason == "max_output_tokens")
                     {
-                        return response.completion(items, FinishReason::MaxTokens);
+                        return response.turn(items, FinishReason::MaxTokens, !tools.is_empty());
                     }
                     return Err(ProviderError::Failed(
                         "ChatGPT returned an incomplete reply.".into(),
@@ -179,6 +218,16 @@ impl Provider for ChatGpt {
         self.request(model, messages, &access_token().await?, ENDPOINT)
             .await
     }
+
+    async fn turn(
+        &self,
+        model: &str,
+        history: &[ModelInput],
+        tools: &[ToolDefinition],
+    ) -> Result<ModelTurn, ProviderError> {
+        self.request_turn(model, history, tools, &access_token().await?, ENDPOINT)
+            .await
+    }
 }
 
 async fn access_token() -> Result<String, ProviderError> {
@@ -215,7 +264,10 @@ async fn checked_response(response: HttpResponse) -> Result<(HttpResponse, Strin
 #[serde(tag = "type")]
 enum ReplyEvent {
     #[serde(rename = "response.output_item.done")]
-    ItemDone { item: OutputItem },
+    ItemDone {
+        item: Value,
+        output_index: Option<usize>,
+    },
     #[serde(rename = "response.completed")]
     Completed { response: Response },
     #[serde(rename = "response.failed")]
@@ -302,7 +354,7 @@ fn failure_message(status: Option<StatusCode>, failure: &Failure, request_id: &s
 #[derive(Deserialize)]
 struct Response {
     #[serde(default)]
-    output: Vec<OutputItem>,
+    output: Vec<Value>,
     incomplete_details: Option<IncompleteDetails>,
 }
 
@@ -312,49 +364,102 @@ struct IncompleteDetails {
 }
 
 impl Response {
-    fn completion(self, streamed: Vec<OutputItem>, mut reason: FinishReason) -> ProviderResult {
+    fn turn(
+        self,
+        mut streamed: Vec<(usize, Value)>,
+        mut reason: FinishReason,
+        tools_enabled: bool,
+    ) -> Result<ModelTurn, ProviderError> {
         let items = if self.output.is_empty() {
-            streamed
+            streamed.sort_unstable_by_key(|(index, _)| *index);
+            if streamed
+                .iter()
+                .enumerate()
+                .any(|(expected, (index, _))| expected != *index)
+            {
+                return Err(ProviderError::Failed(
+                    "Incomplete ChatGPT output items.".into(),
+                ));
+            }
+            streamed.into_iter().map(|(_, item)| item).collect()
         } else {
             self.output
         };
         let mut messages = Vec::new();
-        for item in items {
-            let OutputItem::Message {
-                role,
-                phase,
-                content,
-            } = item
-            else {
-                continue;
-            };
-            if role != "assistant" || phase.as_deref() == Some("commentary") {
-                continue;
-            }
-            let mut message = String::new();
-            for part in content {
-                match part {
-                    Part::OutputText { text } => message.push_str(&text),
-                    Part::Refusal { refusal } => {
-                        message.push_str(&refusal);
-                        reason = FinishReason::Refusal;
+        let mut calls = Vec::new();
+        let mut replayable = true;
+        for item in &items {
+            let output = OutputItem::deserialize(item)
+                .map_err(|_| ProviderError::Failed("Invalid ChatGPT response item.".into()))?;
+            match output {
+                OutputItem::FunctionCall {
+                    namespace,
+                    name,
+                    call_id,
+                    arguments,
+                    status,
+                } => {
+                    if !tools_enabled
+                        || namespace != TOOL_NAMESPACE
+                        || status.as_deref().is_some_and(|s| s != "completed")
+                    {
+                        return Err(ProviderError::Failed(
+                            "Unexpected or incomplete ChatGPT tool call.".into(),
+                        ));
                     }
-                    Part::Other => {}
+                    calls.push(ToolCall {
+                        id: call_id,
+                        name,
+                        arguments: serde_json::from_str(&arguments).map_err(|_| {
+                            ProviderError::Failed("Invalid ChatGPT tool arguments.".into())
+                        })?,
+                    });
                 }
+                OutputItem::Message {
+                    role,
+                    phase,
+                    content,
+                } if role == "assistant" => {
+                    let mut message = String::new();
+                    for part in content {
+                        match part {
+                            Part::OutputText { text } => message.push_str(&text),
+                            Part::Refusal { refusal } => {
+                                message.push_str(&refusal);
+                                reason = FinishReason::Refusal;
+                            }
+                            Part::Other => {}
+                        }
+                    }
+                    if phase.as_deref() != Some("commentary") && !message.is_empty() {
+                        messages.push(message);
+                    }
+                }
+                OutputItem::Reasoning => {}
+                _ => replayable = false,
             }
-            if !message.is_empty() {
-                messages.push(message);
+        }
+        if !calls.is_empty() {
+            if reason != FinishReason::EndTurn || !replayable {
+                return Err(ProviderError::Failed(
+                    "ChatGPT returned an incomplete or unsupported tool turn.".into(),
+                ));
             }
+            validate_calls(&calls)?;
+            return Ok(ModelTurn::Tools(ToolRequest {
+                calls,
+                continuation: Value::Array(items),
+            }));
         }
         if reason == FinishReason::EndTurn && messages.is_empty() {
             return Err(ProviderError::Failed(
                 "ChatGPT completed without a text reply.".into(),
             ));
         }
-        Ok(Completion {
+        Ok(ModelTurn::Reply(Completion {
             text: messages.join("\n"),
             reason,
-        })
+        }))
     }
 }
 
@@ -366,6 +471,14 @@ enum OutputItem {
         phase: Option<String>,
         content: Vec<Part>,
     },
+    FunctionCall {
+        namespace: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        status: Option<String>,
+    },
+    Reasoning,
     #[serde(other)]
     Other,
 }

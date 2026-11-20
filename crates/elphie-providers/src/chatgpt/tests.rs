@@ -4,6 +4,7 @@ use axum::{
     http::HeaderMap,
     routing::{get, post},
 };
+use elphie_core::Role;
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -192,4 +193,133 @@ async fn lists_visible_models_with_account_token_and_provider_order() {
             },
         ]
     );
+}
+
+fn list_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "list_directory".into(),
+        description: "List directory entries.".into(),
+        parameters: json!({"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"], "additionalProperties": false}),
+    }
+}
+
+fn function_call(id: &str, path: &str) -> Value {
+    json!({
+        "type":"function_call", "namespace":"workspace", "name":"list_directory",
+        "call_id":id, "arguments": json!({"path":path}).to_string(), "status":"completed"
+    })
+}
+
+#[tokio::test]
+async fn replays_ordered_items_and_correlated_results_on_a_subscription_request() {
+    let assistant = json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Checking."}]});
+    let reasoning =
+        json!({"type":"reasoning","id":"rs_1","encrypted_content":"fixture","summary":[]});
+    let expected = vec![
+        assistant,
+        reasoning,
+        function_call("c1", "."),
+        function_call("c2", "src"),
+    ];
+    let handler = async move |Json(body): Json<Value>| {
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["name"], "workspace");
+        let function = &body["tools"][0]["tools"][0];
+        assert_eq!(function["name"], "list_directory");
+        assert_eq!(function["parameters"], list_tool().parameters);
+        let input = body["input"].as_array().unwrap();
+        let mut events = Vec::new();
+        let output = if input.len() == 1 {
+            for (index, item) in expected.iter().enumerate().rev() {
+                events.push(
+                    json!({"type":"response.output_item.done", "output_index":index, "item":item}),
+                );
+            }
+            vec![]
+        } else {
+            assert_eq!(&input[1..5], expected.as_slice());
+            assert_eq!(
+                input[5],
+                json!({"type":"function_call_output","call_id":"c1","output":"Cargo.toml"})
+            );
+            assert_eq!(
+                input[6],
+                json!({"type":"function_call_output","call_id":"c2","output":"main.rs"})
+            );
+            vec![
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Found both files."}]}),
+            ]
+        };
+        events.push(json!({"type":"response.completed","response":{"output":output}}));
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+    };
+    let url = serve(Router::new().route("/", post(handler))).await;
+    let provider = ChatGpt::new("fixture").unwrap();
+    let tools = [list_tool()];
+    let mut history = vec![ModelInput::Message(Message {
+        role: Role::User,
+        text: "List the files".into(),
+    })];
+    let turn = provider
+        .request_turn("selected", &history, &tools, TEST_TOKEN, &url)
+        .await
+        .unwrap();
+    let ModelTurn::Tools(request) = turn else {
+        panic!("expected calls")
+    };
+    assert_eq!(request.calls[0].arguments, json!({"path":"."}));
+    assert_eq!(request.calls[1].id, "c2");
+    history.push(ModelInput::Tools {
+        request,
+        outputs: vec!["Cargo.toml".into(), "main.rs".into()],
+    });
+    let turn = provider
+        .request_turn("selected", &history, &tools, TEST_TOKEN, &url)
+        .await
+        .unwrap();
+    assert_eq!(
+        turn,
+        ModelTurn::Reply(Completion {
+            text: "Found both files.".into(),
+            reason: FinishReason::EndTurn
+        })
+    );
+}
+
+#[test]
+fn rejects_malformed_incomplete_and_unsolicited_calls_before_dispatch() {
+    let call = function_call("one", ".");
+    let truncated = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Partial"}]});
+    let mut invalid = call.clone();
+    invalid["arguments"] = json!("{");
+    let mut wrong_shape = call.clone();
+    wrong_shape["arguments"] = json!("[]");
+    let mut incomplete = call.clone();
+    incomplete["status"] = json!("in_progress");
+    let mut other_namespace = call.clone();
+    other_namespace["namespace"] = json!("other");
+    for (items, enabled, reason) in [
+        (vec![invalid], true, FinishReason::EndTurn),
+        (vec![wrong_shape], true, FinishReason::EndTurn),
+        (
+            vec![call.clone(), call.clone()],
+            true,
+            FinishReason::EndTurn,
+        ),
+        (vec![call.clone()], false, FinishReason::EndTurn),
+        (vec![other_namespace], true, FinishReason::EndTurn),
+        (vec![incomplete], true, FinishReason::EndTurn),
+        (vec![truncated, call], true, FinishReason::MaxTokens),
+    ] {
+        let response = Response {
+            output: items,
+            incomplete_details: None,
+        };
+        assert!(response.turn(vec![], reason, enabled).is_err());
+    }
 }
