@@ -1,8 +1,10 @@
+mod mcp;
 mod metadata;
 mod model;
 mod session;
 mod tool_call;
 
+pub use mcp::MCP_SERVERS_META_KEY;
 pub use metadata::implementation;
 
 use std::{
@@ -19,6 +21,7 @@ use agent_client_protocol::{
     schema::ProtocolVersion, v2::schema,
 };
 use elphie_core::Provider;
+use elphie_mcp::McpConfig;
 use elphie_tools::Workspace;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -37,7 +40,16 @@ pub async fn serve_with_tools(
     provider: Arc<dyn Provider>,
     workspace: Option<Arc<Workspace>>,
 ) -> anyhow::Result<()> {
-    Ok(connect(provider, Stdio::new(), workspace).await?)
+    serve_with_mcp(provider, workspace, Arc::new(McpConfig::default())).await
+}
+
+/// MCP tools use only the server and tool grants supplied by the host.
+pub async fn serve_with_mcp(
+    provider: Arc<dyn Provider>,
+    workspace: Option<Arc<Workspace>>,
+    config: Arc<McpConfig>,
+) -> anyhow::Result<()> {
+    Ok(connect(provider, Stdio::new(), workspace, config).await?)
 }
 
 #[derive(Default)]
@@ -64,8 +76,10 @@ async fn connect(
     provider: Arc<dyn Provider>,
     transport: impl ConnectTo<Agent>,
     workspace: Option<Arc<Workspace>>,
+    config: Arc<McpConfig>,
 ) -> agent_client_protocol::Result<()> {
-    let sessions = Sessions::default();
+    let sessions = Arc::new(Sessions::default());
+    let mcp = mcp::HostMcp::new(config);
     let supports_form = AtomicBool::new(false);
     Agent
         .v2()
@@ -84,43 +98,53 @@ async fn connect(
                         ProtocolVersion::V2,
                         implementation("elphie", "Elphie", env!("CARGO_PKG_VERSION")),
                     )
-                    .capabilities(
-                        schema::AgentCapabilities::new()
-                            .session(schema::SessionCapabilities::new()),
-                    ),
+                    .capabilities(schema::AgentCapabilities::new().session(mcp.capabilities())),
                 )
             },
             on_receive_request!(),
         )
         .on_receive_request(
             async |request: schema::NewSessionRequest, response, connection| {
-                if let Err(error) =
-                    validate_setup(&request.cwd, &request.mcp_servers, &request.system_prompt)
-                {
+                if let Err(error) = validate_setup(&request.cwd, &request.system_prompt) {
                     return response.respond_with_error(error);
                 }
-                let id = schema::SessionId::new(Uuid::new_v4().to_string());
-                let (tx, rx) = mpsc::unbounded_channel();
+                let servers = match mcp.select(&request.mcp_servers) {
+                    Ok(servers) => servers,
+                    Err(error) => return response.respond_with_error(error),
+                };
                 let form = supports_form.load(Ordering::Relaxed);
-                let session = Session::new(
-                    id.clone(),
-                    request.cwd.clone(),
-                    provider.clone(),
-                    connection.clone(),
-                    form,
-                    workspace.clone(),
-                );
-                connection.spawn(session.run(rx))?;
-                sessions.0.lock().unwrap().insert(
-                    id.clone(),
-                    SessionHandle {
-                        cwd: request.cwd,
-                        commands: tx,
-                    },
-                );
-                response.respond(
-                    schema::NewSessionResponse::new(id).available_commands(model::commands(form)),
-                )
+                let setup = mcp.open(servers);
+                let provider = provider.clone();
+                let workspace = workspace.clone();
+                let sessions = sessions.clone();
+                let client = connection.clone();
+                connection.spawn(async move {
+                    let cancellation = response.cancellation();
+                    let mcp = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return response.respond_with_error(Error::request_cancelled()),
+                        result = setup => match result {
+                            Ok(mcp) => mcp,
+                            Err(error) => return response.respond_with_error(error),
+                        },
+                    };
+                    let id = schema::SessionId::new(Uuid::new_v4().to_string());
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let meta = mcp.as_ref().map(|s| s.meta());
+                    let session = Session::new(
+                        id.clone(), request.cwd.clone(), provider, client.clone(), form,
+                        workspace, mcp,
+                    );
+                    client.spawn(session.run(rx))?;
+                    let mut sessions = sessions.0.lock().unwrap();
+                    response.respond(
+                        schema::NewSessionResponse::new(id.clone())
+                            .available_commands(model::commands(form))
+                            .meta(meta),
+                    )?;
+                    sessions.insert(id, SessionHandle { cwd: request.cwd, commands: tx });
+                    Ok(())
+                })
             },
             on_receive_request!(),
         )
@@ -153,14 +177,19 @@ async fn connect(
         )
         .on_receive_request(
             async |request: schema::ResumeSessionRequest, response, _| {
-                if let Err(error) =
-                    validate_setup(&request.cwd, &request.mcp_servers, &request.system_prompt)
-                {
+                if let Err(error) = validate_setup(&request.cwd, &request.system_prompt) {
                     return response.respond_with_error(error);
                 }
+                let servers = match mcp.select(&request.mcp_servers) {
+                    Ok(servers) => servers,
+                    Err(error) => return response.respond_with_error(error),
+                };
+                let names = servers.iter().map(|server| server.name.clone()).collect();
                 sessions.send(
                     &request.session_id,
-                    Command::Resume(request.cwd, request.replay_from, response),
+                    Command::Resume(
+                        request.cwd, request.replay_from, names, mcp.open(servers), response,
+                    ),
                 )
             },
             on_receive_request!(),
@@ -192,10 +221,9 @@ async fn connect(
 
 fn validate_setup(
     cwd: &schema::AbsolutePath,
-    mcp: &[schema::McpServer],
     system_prompt: &Option<schema::SystemPrompt>,
 ) -> agent_client_protocol::Result<()> {
-    if !AsRef::<Path>::as_ref(cwd).is_absolute() || !mcp.is_empty() || system_prompt.is_some() {
+    if !AsRef::<Path>::as_ref(cwd).is_absolute() || system_prompt.is_some() {
         return Err(Error::invalid_params());
     }
     Ok(())

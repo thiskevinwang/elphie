@@ -7,8 +7,9 @@ use std::{
 
 use crate::{
     MODEL_META_KEY,
+    mcp::{OpenMcp, SessionMcp},
     model::{self, Selection},
-    tool_call::{self, Batch},
+    tool_call::{self, Batch, SessionTools},
 };
 use agent_client_protocol::{
     Client, Error, Result,
@@ -31,6 +32,8 @@ pub(super) enum Command {
     Resume(
         AbsolutePath,
         Option<ReplayFrom>,
+        Vec<String>,
+        OpenMcp,
         Responder<ResumeSessionResponse>,
     ),
     Cancel,
@@ -42,7 +45,7 @@ impl Command {
         let missing = agent_client_protocol::v2::schema::Error::session_not_found(id.clone());
         match self {
             Self::Prompt(_, _, response) => response.respond_with_error(missing.into()),
-            Self::Resume(_, _, response) => response.respond_with_error(missing.into()),
+            Self::Resume(_, _, _, _, response) => response.respond_with_error(missing.into()),
             Self::Cancel => Ok(()),
             Self::Close(response) => response.respond(CloseSessionResponse::new()),
         }
@@ -54,6 +57,23 @@ struct Submission {
     text: String,
     content: Vec<ContentBlock>,
     responses: Vec<Responder<PromptResponse>>,
+}
+
+struct PendingResume {
+    cursor: Option<ReplayFrom>,
+    response: Responder<ResumeSessionResponse>,
+    setup: OpenMcp,
+}
+
+impl PendingResume {
+    async fn wait(&mut self) -> Result<Option<Arc<SessionMcp>>> {
+        let cancellation = self.response.cancellation();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::request_cancelled()),
+            result = &mut self.setup => result,
+        }
+    }
 }
 
 enum Outcome {
@@ -69,13 +89,13 @@ type Pending = Pin<Box<dyn Future<Output = Result<Outcome>> + Send>>;
 enum Work {
     Running(Pending),
     Choosing(Pending),
-    Reading(ToolCallId, Pending),
+    CallingTool(ToolCallId, Pending),
 }
 
 impl Work {
     async fn wait(&mut self) -> Result<Outcome> {
         match self {
-            Work::Running(pending) | Work::Choosing(pending) | Work::Reading(_, pending) => {
+            Work::Running(pending) | Work::Choosing(pending) | Work::CallingTool(_, pending) => {
                 pending.await
             }
         }
@@ -92,7 +112,8 @@ pub(super) struct Session {
     model: String,
     transcript: Vec<SessionUpdate>,
     history: Vec<ModelInput>,
-    workspace: Option<Arc<Workspace>>,
+    tools: SessionTools,
+    resume: Option<PendingResume>,
     remaining_calls: usize,
     inserted: HashMap<IdempotencyKey, MessageId>,
     held: VecDeque<Submission>,
@@ -107,6 +128,7 @@ impl Session {
         client: ConnectionTo<Client>,
         supports_form: bool,
         workspace: Option<Arc<Workspace>>,
+        mcp: Option<Arc<SessionMcp>>,
     ) -> Self {
         Self {
             id,
@@ -118,7 +140,8 @@ impl Session {
             supports_form,
             transcript: Vec::new(),
             history: Vec::new(),
-            workspace,
+            tools: SessionTools { workspace, mcp },
+            resume: None,
             remaining_calls: 0,
             inserted: HashMap::new(),
             held: VecDeque::new(),
@@ -137,6 +160,16 @@ impl Session {
                     Some(command) => self.handle(command)?,
                     None => return Ok(()),
                 },
+                result = async { self.resume.as_mut().unwrap().wait().await }, if self.resume.is_some() => {
+                    let resume = self.resume.take().unwrap();
+                    match result {
+                        Ok(mcp) => {
+                            self.tools.mcp = mcp;
+                            self.sync_resume(resume.cursor, resume.response)?;
+                        }
+                        Err(error) => resume.response.respond_with_error(error)?,
+                    }
+                },
                 outcome = async { self.work.as_mut().unwrap().wait().await }, if self.work.is_some() => {
                     self.work = None;
                     self.finish(outcome)?;
@@ -152,7 +185,7 @@ impl Session {
 
     fn handle(&mut self, command: Command) -> Result<()> {
         match command {
-            Command::Resume(cwd, cursor, response) => {
+            Command::Resume(cwd, cursor, names, setup, response) => {
                 if cwd != self.cwd
                     || cursor
                         .as_ref()
@@ -160,31 +193,67 @@ impl Session {
                 {
                     return response.respond_with_error(Error::invalid_params());
                 }
-                self.active = true;
-                if cursor.is_some() {
-                    for update in &self.transcript {
-                        self.send(update.clone())?;
-                    }
-                    self.send(SessionUpdate::ReplayComplete(ReplayComplete::new()))?;
+                self.cancel_resume()?;
+                if names
+                    == self
+                        .tools
+                        .mcp
+                        .as_ref()
+                        .map(|m| m.names())
+                        .unwrap_or_default()
+                {
+                    return self.sync_resume(cursor, response);
                 }
-                self.send(SessionUpdate::SessionInfoUpdate(
-                    SessionInfoUpdate::new().title(None).updated_at(None),
-                ))?;
-                self.send_state(None)?;
-                response.respond(
-                    ResumeSessionResponse::new()
-                        .available_commands(model::commands(self.supports_form)),
-                )
+                self.resume = Some(PendingResume {
+                    cursor,
+                    response,
+                    setup,
+                });
+                Ok(())
+            }
+            Command::Close(response) => {
+                self.cancel_resume()?;
+                self.cancel()?;
+                self.tools.mcp = None;
+                self.active = false;
+                response.respond(CloseSessionResponse::new())
             }
             command if !self.active => command.unknown_session(&self.id),
             Command::Prompt(content, key, response) => self.enqueue(content, key, response),
             Command::Cancel => self.cancel(),
-            Command::Close(response) => {
-                self.cancel()?;
-                self.active = false;
-                response.respond(CloseSessionResponse::new())
-            }
         }
+    }
+
+    fn sync_resume(
+        &mut self,
+        cursor: Option<ReplayFrom>,
+        response: Responder<ResumeSessionResponse>,
+    ) -> Result<()> {
+        self.active = true;
+        if cursor.is_some() {
+            for update in &self.transcript {
+                self.send(update.clone())?;
+            }
+            self.send(SessionUpdate::ReplayComplete(ReplayComplete::new()))?;
+        }
+        self.send(SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title(None).updated_at(None),
+        ))?;
+        self.send_state(None)?;
+        response.respond(
+            ResumeSessionResponse::new()
+                .available_commands(model::commands(self.supports_form))
+                .meta(self.tools.mcp.as_ref().map(|s| s.meta())),
+        )
+    }
+
+    fn cancel_resume(&mut self) -> Result<()> {
+        if let Some(pending) = self.resume.take() {
+            pending
+                .response
+                .respond_with_error(Error::request_cancelled())?;
+        }
+        Ok(())
     }
 
     fn enqueue(
@@ -239,7 +308,7 @@ impl Session {
         let provider = self.provider.clone();
         let pending: Pending = if model_command {
             let supports_form = self.supports_form;
-            let tools_enabled = self.workspace.is_some();
+            let tools_enabled = self.tools.enabled();
             Box::pin(async move {
                 if !supports_form {
                     return Ok(Outcome::FormUnsupported);
@@ -266,11 +335,12 @@ impl Session {
     fn model_turn(&self) -> Pending {
         let provider = self.provider.clone();
         let model = self.model.clone();
-        if self.workspace.is_some() {
+        if self.tools.enabled() {
+            let definitions = self.tools.definitions();
             let history = self.history.clone();
             Box::pin(async move {
                 provider
-                    .turn(&model, &history, &elphie_tools::definitions())
+                    .turn(&model, &history, &definitions)
                     .await
                     .map(Outcome::Turn)
                     .map_err(provider_error)
@@ -296,16 +366,15 @@ impl Session {
 
     fn run_batch(&mut self, batch: Batch) -> Result<()> {
         if let Some(call) = batch.next().cloned() {
-            let workspace = self.workspace.clone().ok_or_else(Error::internal_error)?;
+            let tools = self.tools.clone();
             let id = ToolCallId::new(Uuid::new_v4().to_string());
-            self.record(SessionUpdate::ToolCallUpdate(tool_call::started(
-                id.clone(),
-                &call,
-            )))?;
-            self.work = Some(Work::Reading(
+            self.record(SessionUpdate::ToolCallUpdate(
+                tools.started(id.clone(), &call),
+            ))?;
+            self.work = Some(Work::CallingTool(
                 id.clone(),
                 Box::pin(async move {
-                    let result = tool_call::execute(workspace, call).await;
+                    let result = tools.execute(call).await;
                     Ok(Outcome::ToolFinished(batch, id, result))
                 }),
             ));
@@ -324,7 +393,7 @@ impl Session {
         }
         if let Some(work) = self.work.take() {
             let tool_id = match &work {
-                Work::Reading(id, _) => Some(id.clone()),
+                Work::CallingTool(id, _) => Some(id.clone()),
                 _ => None,
             };
             drop(work);
@@ -430,7 +499,7 @@ impl Session {
 
     fn send_state(&self, reason: Option<StopReason>) -> Result<()> {
         let state = match self.work {
-            Some(Work::Running(_) | Work::Reading(_, _)) => {
+            Some(Work::Running(_) | Work::CallingTool(_, _)) => {
                 StateUpdate::Running(RunningStateUpdate::new().background(vec![]))
             }
             Some(Work::Choosing(_)) => {

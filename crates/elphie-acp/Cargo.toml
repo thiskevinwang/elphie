@@ -7,14 +7,16 @@ rust-version.workspace = true
 [dependencies]
 agent-client-protocol = { version = "=5.4.0", features = ["stdio", "unstable_protocol_v2"] }
 anyhow = "1"
-base64 = "0.22"
 elphie-core = { path = "../elphie-core" }
+elphie-mcp = { path = "../elphie-mcp" }
 elphie-tools = { path = "../elphie-tools" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 
 [dev-dependencies]
+axum = "0.8"
 async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "rt", "time"] }

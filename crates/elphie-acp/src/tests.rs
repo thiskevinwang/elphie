@@ -83,12 +83,21 @@ impl ClientIo {
     }
 
     fn with_provider(provider: Arc<dyn Provider>, workspace: Option<Arc<Workspace>>) -> Self {
+        Self::with_mcp(provider, workspace, McpConfig::default())
+    }
+
+    fn with_mcp(
+        provider: Arc<dyn Provider>,
+        workspace: Option<Arc<Workspace>>,
+        config: McpConfig,
+    ) -> Self {
         let (client, server) = tokio::io::duplex(16384);
         let (reader, writer) = tokio::io::split(server);
         tokio::spawn(connect(
             provider,
             ByteStreams::new(writer.compat_write(), reader.compat()),
             workspace,
+            Arc::new(config),
         ));
         let (output, input) = tokio::io::split(client);
         Self {
@@ -202,6 +211,7 @@ impl ClientIo {
     }
 }
 
+mod mcp_sessions;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod tools;
 

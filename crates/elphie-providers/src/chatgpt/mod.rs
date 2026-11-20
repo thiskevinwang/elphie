@@ -136,7 +136,7 @@ impl ChatGpt {
                 .collect();
             body["tools"] = json!([{
                 "type": "namespace", "name": TOOL_NAMESPACE,
-                "description": "Work with the current workspace.", "tools": functions
+                "description": "Use the tools available in this session.", "tools": functions
             }]);
         }
         let response = self

@@ -1,10 +1,11 @@
 use std::{collections::HashSet, sync::Arc};
 
+use crate::mcp::SessionMcp;
 use agent_client_protocol::{
     Error, Result,
     v2::schema::{ErrorCode, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind},
 };
-use elphie_core::{ModelInput, ToolCall, ToolRequest};
+use elphie_core::{ModelInput, ToolCall, ToolDefinition, ToolRequest};
 use elphie_tools::Workspace;
 use tokio::task::JoinSet;
 
@@ -58,21 +59,63 @@ impl Batch {
     }
 }
 
-pub(super) fn started(id: ToolCallId, call: &ToolCall) -> ToolCallUpdate {
-    let (kind, verb) = match call.name.as_str() {
-        "read_file" => (ToolKind::Read, "Read file"),
-        "list_directory" => (ToolKind::Search, "List directory"),
-        _ => (ToolKind::Other, "Unknown tool"),
-    };
-    let title = match call.arguments.get("path").and_then(|v| v.as_str()) {
-        Some(path) if kind != ToolKind::Other => format!("{verb} {}", display_text(path)),
-        _ => verb.to_string(),
-    };
-    ToolCallUpdate::new(id)
-        .name(display_text(&call.name))
-        .title(title)
-        .kind(kind)
-        .status(ToolCallStatus::InProgress)
+#[derive(Clone)]
+pub(super) struct SessionTools {
+    pub workspace: Option<Arc<Workspace>>,
+    pub mcp: Option<Arc<SessionMcp>>,
+}
+
+impl SessionTools {
+    pub fn enabled(&self) -> bool {
+        self.workspace.is_some() || self.mcp.is_some()
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let mut tools = self
+            .workspace
+            .as_ref()
+            .map(|_| elphie_tools::definitions())
+            .unwrap_or_default();
+        if let Some(mcp) = &self.mcp {
+            tools.extend_from_slice(mcp.client.definitions());
+        }
+        tools
+    }
+
+    pub fn started(&self, id: ToolCallId, call: &ToolCall) -> ToolCallUpdate {
+        let (kind, verb) = match call.name.as_str() {
+            "read_file" if self.workspace.is_some() => (ToolKind::Read, "Read file"),
+            "list_directory" if self.workspace.is_some() => (ToolKind::Search, "List directory"),
+            other => (
+                ToolKind::Other,
+                self.mcp
+                    .as_ref()
+                    .and_then(|m| m.client.title(other))
+                    .unwrap_or("Unknown tool"),
+            ),
+        };
+        let title = match call.arguments.get("path").and_then(|v| v.as_str()) {
+            Some(path) if kind != ToolKind::Other => format!("{verb} {}", display_text(path)),
+            _ => display_text(verb),
+        };
+        ToolCallUpdate::new(id)
+            .name(display_text(&call.name))
+            .title(title)
+            .kind(kind)
+            .status(ToolCallStatus::InProgress)
+    }
+
+    pub async fn execute(self, call: ToolCall) -> std::result::Result<String, String> {
+        if let Some(mcp) = &self.mcp
+            && mcp.client.title(&call.name).is_some()
+        {
+            return mcp.client.execute(&call.name, &call.arguments).await;
+        }
+        if let Some(workspace) = self.workspace {
+            return execute_workspace(workspace, call).await;
+        }
+        Err("Unknown tool.".into())
+    }
 }
 
 fn display_text(value: &str) -> String {
@@ -89,7 +132,7 @@ pub(super) fn finished(id: ToolCallId, status: ToolCallStatus, summary: &str) ->
         .content(vec![summary.to_string().into()])
 }
 
-pub(super) async fn execute(
+async fn execute_workspace(
     workspace: Arc<Workspace>,
     call: ToolCall,
 ) -> std::result::Result<String, String> {
