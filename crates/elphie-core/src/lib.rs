@@ -104,6 +104,9 @@ pub struct ModelOption {
 pub trait Provider: Send + Sync {
     fn default_model(&self) -> &str;
     async fn models(&self) -> Result<Vec<ModelOption>, ProviderError>;
+    async fn models_for_tools(&self) -> Result<Vec<ModelOption>, ProviderError> {
+        self.models().await
+    }
     async fn complete(&self, model: &str, messages: &[Message]) -> ProviderResult;
     async fn turn(
         &self,

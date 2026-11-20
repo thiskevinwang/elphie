@@ -51,7 +51,50 @@ impl Ollama {
         url
     }
 
-    async fn chat_model(&self, id: String) -> Result<Option<ModelOption>, ProviderError> {
+    async fn installed_models(
+        &self,
+        require_tools: bool,
+    ) -> Result<Vec<ModelOption>, ProviderError> {
+        #[derive(Deserialize)]
+        struct Tags {
+            models: Vec<Tag>,
+        }
+        #[derive(Deserialize)]
+        struct Tag {
+            name: String,
+        }
+        let fetch_error = |e| ProviderError::Failed(format!("Cannot list Ollama models: {e}"));
+        let tags: Tags = self
+            .http
+            .get(self.endpoint("/api/tags"))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(fetch_error)?
+            .error_for_status()
+            .map_err(fetch_error)?
+            .json()
+            .await
+            .map_err(fetch_error)?;
+        let mut seen = HashSet::new();
+        let names = tags
+            .models
+            .into_iter()
+            .map(|tag| tag.name)
+            .filter(|name| !name.trim().is_empty() && seen.insert(name.clone()));
+        stream::iter(names)
+            .map(|id| self.chat_model(id, require_tools))
+            .buffered(4)
+            .try_filter_map(|item| std::future::ready(Ok(item)))
+            .try_collect()
+            .await
+    }
+
+    async fn chat_model(
+        &self,
+        id: String,
+        require_tools: bool,
+    ) -> Result<Option<ModelOption>, ProviderError> {
         #[derive(Deserialize)]
         struct Details {
             capabilities: Option<Vec<String>>,
@@ -76,10 +119,10 @@ impl Ollama {
             .json()
             .await
             .map_err(fetch_error)?;
-        if details
-            .capabilities
-            .is_some_and(|caps| !caps.iter().any(|c| c == "completion"))
-        {
+        if details.capabilities.is_some_and(|caps| {
+            !caps.iter().any(|c| c == "completion")
+                || (require_tools && !caps.iter().any(|c| c == "tools"))
+        }) {
             return Ok(None);
         }
         // Ollama lists untagged model names with their implicit :latest tag.
@@ -183,39 +226,11 @@ impl Provider for Ollama {
     }
 
     async fn models(&self) -> Result<Vec<ModelOption>, ProviderError> {
-        #[derive(Deserialize)]
-        struct Tags {
-            models: Vec<Tag>,
-        }
-        #[derive(Deserialize)]
-        struct Tag {
-            name: String,
-        }
-        let fetch_error = |e| ProviderError::Failed(format!("Cannot list Ollama models: {e}"));
-        let tags: Tags = self
-            .http
-            .get(self.endpoint("/api/tags"))
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(fetch_error)?
-            .error_for_status()
-            .map_err(fetch_error)?
-            .json()
-            .await
-            .map_err(fetch_error)?;
-        let mut seen = HashSet::new();
-        let names = tags
-            .models
-            .into_iter()
-            .map(|tag| tag.name)
-            .filter(|name| !name.trim().is_empty() && seen.insert(name.clone()));
-        stream::iter(names)
-            .map(|id| self.chat_model(id))
-            .buffered(4)
-            .try_filter_map(|item| std::future::ready(Ok(item)))
-            .try_collect()
-            .await
+        self.installed_models(false).await
+    }
+
+    async fn models_for_tools(&self) -> Result<Vec<ModelOption>, ProviderError> {
+        self.installed_models(true).await
     }
 
     async fn complete(&self, model: &str, messages: &[Message]) -> ProviderResult {
@@ -258,11 +273,26 @@ impl Provider for Ollama {
             .map_err(|error| {
                 ProviderError::Failed(format!("Cannot reach Ollama at {}: {error}", self.host))
             })?;
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
+            if status == StatusCode::BAD_REQUEST && !tools.is_empty() {
+                #[derive(Deserialize)]
+                struct OllamaError {
+                    error: String,
+                }
+                if response
+                    .json::<OllamaError>()
+                    .await
+                    .is_ok_and(|body| body.error.ends_with("does not support tools"))
+                {
+                    return Err(ProviderError::Failed(
+                        "This Ollama model cannot use tools. Choose a model with /model or restart without --tools.".into(),
+                    ));
+                }
+            }
             return Err(ProviderError::Failed(format!(
                 "Ollama returned HTTP {} for model {}",
-                response.status(),
-                model
+                status, model
             )));
         }
         let reply: ChatResponse = response
@@ -326,6 +356,7 @@ mod tests {
                         "models": [
                             {"name": "chat:1"},
                             {"name": "embed:1"},
+                            {"name": "text:1"},
                             {"name": "legacy:latest"},
                             {"name": "gone"}
                         ]
@@ -338,6 +369,7 @@ mod tests {
                     let caps = match body["model"].as_str().unwrap() {
                         "chat:1" => json!({"capabilities":["completion", "tools"]}),
                         "embed:1" => json!({"capabilities":["embedding"]}),
+                        "text:1" => json!({"capabilities":["completion"]}),
                         "legacy:latest" => json!({}),
                         "gone" => return (StatusCode::NOT_FOUND, Json(json!({}))),
                         _ => panic!("Unexpected tag"),
@@ -348,11 +380,40 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let provider = Ollama::new(&url, "legacy".into()).unwrap();
         let models = provider.models().await.unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "chat:1");
-        assert_eq!(models[1].name, "legacy:latest");
-        assert_eq!(models[1].id, provider.default_model());
+        assert_eq!(models[1].id, "text:1");
+        assert_eq!(models[2].name, "legacy:latest");
+        assert_eq!(models[2].id, provider.default_model());
+        let tool_models = provider.models_for_tools().await.unwrap();
+        assert_eq!(tool_models, [models[0].clone(), models[2].clone()]);
     }
+
+    #[tokio::test]
+    async fn points_to_model_selection_when_an_explicit_model_rejects_tools() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/api/chat",
+            post(async || {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":"internal model path does not support tools"})),
+                )
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = Ollama::new(&url, "text-only".into()).unwrap();
+        let error = provider
+            .turn(provider.default_model(), &[], &[list_tool()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/model"));
+        assert!(error.contains("without --tools"));
+        assert!(!error.contains("internal model path"));
+    }
+
     fn list_tool() -> ToolDefinition {
         ToolDefinition {
             name: "list_directory".into(),
