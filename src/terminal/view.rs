@@ -181,6 +181,12 @@ fn session_header(frame: &mut Frame, area: Rect, chat: &Chat, provider: &str) {
     if let Some(directory) = chat.read_directory() {
         details.push_str(&format!(" · read-only {}", inline(directory)));
     }
+    if !chat.mcp_servers().is_empty() {
+        details.push_str(&format!(
+            " · MCP {}",
+            inline(&chat.mcp_servers().join(", "))
+        ));
+    }
     if area.height >= 3 {
         let (_, content) = split_top(area, 1);
         let (title, info) = split_top(content, 1);

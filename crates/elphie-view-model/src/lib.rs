@@ -87,6 +87,7 @@ pub enum Event {
     },
     DismissModel(FormId),
     ModelChanged(String),
+    McpServers(Vec<String>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -104,6 +105,7 @@ pub struct Chat {
     error: Option<String>,
     model: String,
     read_directory: Option<String>,
+    mcp_servers: Vec<String>,
     help_open: bool,
     pickers: VecDeque<ModelPicker>,
     prompts: Vec<String>,
@@ -145,6 +147,10 @@ impl Chat {
 
     pub fn read_directory(&self) -> Option<&str> {
         self.read_directory.as_deref()
+    }
+
+    pub fn mcp_servers(&self) -> &[String] {
+        &self.mcp_servers
     }
 
     pub fn help_open(&self) -> bool {
@@ -300,6 +306,7 @@ impl Chat {
                     .retain(|picker| picker.request_id != request_id);
             }
             Event::ModelChanged(model) => self.model = model,
+            Event::McpServers(servers) => self.mcp_servers = servers,
             Event::Message(role, id, edit) => {
                 let existing = self.entries.iter_mut().find_map(|entry| match entry {
                     TranscriptEntry::Message { id: key, message }

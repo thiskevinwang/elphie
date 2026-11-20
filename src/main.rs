@@ -48,6 +48,13 @@ struct Options {
         help = "Let the model list and read files in this directory. Results go to the selected provider"
     )]
     tools: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        help = "Enable MCP servers and tools listed in this JSON file"
+    )]
+    mcp_config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -102,7 +109,13 @@ async fn main() -> Result<()> {
             .transpose()
             .context("Could not open the workspace for tools")?
             .map(Arc::new);
-        return elphie_acp::serve_with_tools(provider, workspace).await;
+        let mcp = options
+            .mcp_config
+            .as_deref()
+            .map(elphie_mcp::McpConfig::load)
+            .transpose()?
+            .unwrap_or_default();
+        return elphie_acp::serve_with_mcp(provider, workspace, Arc::new(mcp)).await;
     }
     let mut config = AcpAgentConfig::new(std::env::current_exe()?).args([
         "serve",
@@ -120,6 +133,12 @@ async fn main() -> Result<()> {
             .context("The terminal requires a UTF-8 workspace path")?;
         config = config.arg(format!("--tools={directory}"));
         chat = chat.with_read_directory(directory);
+    }
+    if let Some(path) = options.mcp_config {
+        let path = path
+            .to_str()
+            .context("The terminal requires a UTF-8 MCP config path")?;
+        config = config.arg(format!("--mcp-config={path}"));
     }
     let agent = AcpAgent::new(config);
     let (send_action, actions) = mpsc::unbounded_channel();

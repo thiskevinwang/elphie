@@ -40,6 +40,36 @@ File tools are off by default. The directory passed to `--tools` sets the read b
 
 A prompt can make up to eight tool calls. Each call returns up to 32 KiB. File reads require UTF-8 text. Directory listings return up to 256 visible entries and stop with an error if the directory exceeds the scan limit of 1,024 entries. Tool access requires macOS with `O_NOFOLLOW_ANY` or Linux with `openat2`. Linux rejects kernel filesystems such as `/proc` and `/sys` as tool directories.
 
+## Connect MCP tools
+
+For a running MCP server that offers a `search` tool, save this example as `~/.elphie/mcp.json`. Set the URL and tool name to match your server.
+
+```json
+{
+  "servers": [
+    {
+      "name": "docs",
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "tools": ["search"]
+    }
+  ]
+}
+```
+
+```sh
+elphie --mcp-config ~/.elphie/mcp.json
+```
+
+Ask Elphie to search the connected docs. The header shows the connected server names. Each tool call appears in the transcript with its server, tool name, and status. Add `--tools .` to also grant Elphie’s built-in file tools.
+
+- **HTTP** uses Streamable HTTP. Use HTTPS for remote servers. For bearer authentication, add `"bearerTokenEnv": "DOCS_TOKEN"` and set that variable before starting Elphie.
+- **Stdio** starts a trusted local program. Set `"type": "stdio"`, replace `url` with an absolute `command` path, and specify `args` as a list. To pass selected environment variables, add their names to `env`. The program starts in its executable’s directory and runs with your OS account permissions, independently of `--tools`.
+
+The config file grants access to the names in each server’s `tools` list. Elphie opens it only when you pass `--mcp-config`. Calls run without a separate approval prompt. The MCP server receives the call arguments. The selected model provider receives the tool descriptions and results. A tool can change data if its server permits it. Cancelling a turn cannot undo work the server already performed.
+
+Elphie discovers tools when the session connects and supports text and structured JSON results. Rust hosts can use `McpClient::connect_authorized` with an OAuth grant for the same HTTP resource, including one obtained with a Client ID Metadata Document. [MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) · [OAuth example](crates/elphie-oauth/README.md)
+
 ## Connect a desktop client
 
 Start `elphie serve` as a child process. Use the same provider and model flags as the terminal. Exchange one JSON-RPC message per line on its standard streams.
@@ -56,6 +86,8 @@ To enable `/model`, advertise `"elicitation": {"form": {}}` in the client capabi
 
 Start `elphie serve --tools ./project` to grant the same read access for a desktop client. Apply each `tool_call_update` to its `toolCallId`. A later update changes the same transcript row. The server sends the path, status, and result size or error. File contents go to the model. [ACP tool calls](https://agentclientprotocol.com/protocol/v2/tool-calls)
 
+Pass `--mcp-config` to `elphie serve` to enable MCP for a desktop client. Inspect `capabilities.session.mcp` for supported transports. An empty `mcpServers` uses the host configuration. To select fewer servers on `session/new` or `session/resume`, send their matching names and URLs or executable paths and arguments. Credentials and child environment variables come from the host configuration. Successful setup reports the active names in `_meta["io.github.thiskevinwang.elphie/mcp-servers"]`.
+
 The server also supports listing sessions, resuming them with transcript replay, and retrying submissions with an idempotency key. Resource links enter the prompt as a name and URI. ACP v2 is a draft. The project pins its Rust SDK version. [ACP v2](https://agentclientprotocol.com/protocol/v2/overview) · [Rust SDK](https://agentclientprotocol.com/libraries/rust)
 
 ## Code map
@@ -69,6 +101,7 @@ The server also supports listing sessions, resuming them with transcript replay,
 | `elphie-core` | Define provider-independent messages and the provider interface. |
 | `elphie-acp` | Own session history, tool execution order, cancellation, and replay. |
 | `elphie-tools` | Define the workspace tools and enforce read limits through the operating system. |
+| `elphie-mcp` | Connect trusted MCP servers, discover granted tools, and route calls and results. |
 | `elphie-providers` | Send conversation history to ChatGPT or Ollama. |
 | `elphie-signin` | Register Elphie with ChatGPT and manage its account credentials. |
 | `elphie-oauth` | Authorize a host to access an MCP resource with the official Rust MCP SDK. |
@@ -86,9 +119,10 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo build --locked
 python3 tests/terminal.py
+python3 tests/mcp.py
 ```
 
-The last check uses a pseudo-terminal and a local Ollama fixture. It covers model selection, multiline input, cancellation, and tool calls. It checks that a permitted file reaches the provider and that a symbolic link to another directory fails.
+The terminal checks use a pseudo-terminal and a local Ollama fixture. They cover model selection, multiline input, cancellation, workspace reads, and tool calls across both MCP transports. All provider and MCP traffic in these tests stays on the machine.
 
 To run the upstream ACP suite with the same local fixture, install the tested revision of the kit and run the following commands. The report lists exercised and skipped requirements. [ACP compatibility kit](https://github.com/agentclientprotocol/acp-tck/tree/7c71c4d1af0994e73bdc100c9f7f6b98f2319cda)
 

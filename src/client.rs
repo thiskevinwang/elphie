@@ -96,12 +96,25 @@ pub async fn run(
             if init.protocol_version != ProtocolVersion::V2 || init.capabilities.session.is_none() {
                 return Err(Error::invalid_params().data("Elphie requires ACP v2 sessions"));
             }
-            let session = connection
+            let setup = connection
                 .build_session_cwd()?
                 .start_session()
                 .block_task()
-                .await?
-                .session;
+                .await?;
+            if let Some(servers) = setup
+                .response
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(elphie_acp::MCP_SERVERS_META_KEY))
+                .and_then(|value| value.as_array())
+            {
+                let names = servers
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect();
+                let _ = events.send(Event::McpServers(names));
+            }
+            let session = setup.session;
             let _ = events.send(Event::Phase(Phase::Ready));
             while let Some(action) = actions.recv().await {
                 match action {

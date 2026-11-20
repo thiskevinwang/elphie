@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 elphie-acp = { path = "crates/elphie-acp" }
 elphie-core = { path = "crates/elphie-core" }
+elphie-mcp = { path = "crates/elphie-mcp" }
 elphie-providers = { path = "crates/elphie-providers" }
 elphie-signin = { path = "crates/elphie-signin" }
 elphie-tools = { path = "crates/elphie-tools" }
