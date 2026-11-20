@@ -262,6 +262,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "elphie-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "elphie-oauth"
 version = "0.1.0"
 dependencies = [

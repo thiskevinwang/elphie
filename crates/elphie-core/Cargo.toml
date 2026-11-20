@@ -1,0 +1,9 @@
+[package]
+name = "elphie-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
