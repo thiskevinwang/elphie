@@ -1,6 +1,7 @@
 mod metadata;
 mod model;
 mod session;
+mod tool_call;
 
 pub use metadata::implementation;
 
@@ -18,6 +19,7 @@ use agent_client_protocol::{
     schema::ProtocolVersion, v2::schema,
 };
 use elphie_core::Provider;
+use elphie_tools::Workspace;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -27,7 +29,15 @@ use session::{Command, Session};
 pub const MODEL_META_KEY: &str = "io.github.thiskevinwang.elphie/model";
 
 pub async fn serve(provider: Arc<dyn Provider>) -> anyhow::Result<()> {
-    Ok(connect(provider, Stdio::new()).await?)
+    serve_with_tools(provider, None).await
+}
+
+/// All sessions share the workspace granted by the host. ACP requests cannot change it.
+pub async fn serve_with_tools(
+    provider: Arc<dyn Provider>,
+    workspace: Option<Arc<Workspace>>,
+) -> anyhow::Result<()> {
+    Ok(connect(provider, Stdio::new(), workspace).await?)
 }
 
 #[derive(Default)]
@@ -53,6 +63,7 @@ impl Sessions {
 async fn connect(
     provider: Arc<dyn Provider>,
     transport: impl ConnectTo<Agent>,
+    workspace: Option<Arc<Workspace>>,
 ) -> agent_client_protocol::Result<()> {
     let sessions = Sessions::default();
     let supports_form = AtomicBool::new(false);
@@ -97,6 +108,7 @@ async fn connect(
                     provider.clone(),
                     connection.clone(),
                     form,
+                    workspace.clone(),
                 );
                 connection.spawn(session.run(rx))?;
                 sessions.0.lock().unwrap().insert(

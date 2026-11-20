@@ -8,12 +8,17 @@ use std::{
 use crate::{
     MODEL_META_KEY,
     model::{self, Selection},
+    tool_call::{self, Batch},
 };
 use agent_client_protocol::{
     Client, Error, Result,
     v2::{ConnectionTo, Responder, schema::*},
 };
-use elphie_core::{Completion, FinishReason, Message, ModelOption, Provider, ProviderError, Role};
+use elphie_core::{
+    Completion, FinishReason, Message, ModelInput, ModelOption, ModelTurn, Provider, ProviderError,
+    Role,
+};
+use elphie_tools::Workspace;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -52,7 +57,8 @@ struct Submission {
 }
 
 enum Outcome {
-    Reply(Completion),
+    Turn(ModelTurn),
+    ToolFinished(Batch, ToolCallId, std::result::Result<String, String>),
     Models(Vec<ModelOption>),
     Selection(Selection),
     FormUnsupported,
@@ -63,12 +69,15 @@ type Pending = Pin<Box<dyn Future<Output = Result<Outcome>> + Send>>;
 enum Work {
     Running(Pending),
     Choosing(Pending),
+    Reading(ToolCallId, Pending),
 }
 
 impl Work {
     async fn wait(&mut self) -> Result<Outcome> {
         match self {
-            Work::Running(pending) | Work::Choosing(pending) => pending.await,
+            Work::Running(pending) | Work::Choosing(pending) | Work::Reading(_, pending) => {
+                pending.await
+            }
         }
     }
 }
@@ -82,7 +91,9 @@ pub(super) struct Session {
     supports_form: bool,
     model: String,
     transcript: Vec<SessionUpdate>,
-    messages: Vec<Message>,
+    history: Vec<ModelInput>,
+    workspace: Option<Arc<Workspace>>,
+    remaining_calls: usize,
     inserted: HashMap<IdempotencyKey, MessageId>,
     held: VecDeque<Submission>,
     work: Option<Work>,
@@ -95,6 +106,7 @@ impl Session {
         provider: Arc<dyn Provider>,
         client: ConnectionTo<Client>,
         supports_form: bool,
+        workspace: Option<Arc<Workspace>>,
     ) -> Self {
         Self {
             id,
@@ -105,7 +117,9 @@ impl Session {
             active: true,
             supports_form,
             transcript: Vec::new(),
-            messages: Vec::new(),
+            history: Vec::new(),
+            workspace,
+            remaining_calls: 0,
             inserted: HashMap::new(),
             held: VecDeque::new(),
             work: None,
@@ -118,6 +132,7 @@ impl Session {
     ) -> Result<()> {
         loop {
             tokio::select! {
+                biased;
                 command = commands.recv() => match command {
                     Some(command) => self.handle(command)?,
                     None => return Ok(()),
@@ -224,33 +239,81 @@ impl Session {
         let provider = self.provider.clone();
         let pending: Pending = if model_command {
             let supports_form = self.supports_form;
+            let tools_enabled = self.workspace.is_some();
             Box::pin(async move {
                 if !supports_form {
                     return Ok(Outcome::FormUnsupported);
                 }
+                let models = if tools_enabled {
+                    provider.models_for_tools().await
+                } else {
+                    provider.models().await
+                };
+                models.map(Outcome::Models).map_err(provider_error)
+            })
+        } else {
+            self.history.push(ModelInput::Message(Message {
+                role: Role::User,
+                text: submission.text,
+            }));
+            self.remaining_calls = tool_call::CALLS_PER_PROMPT;
+            self.model_turn()
+        };
+        self.work = Some(Work::Running(pending));
+        self.send_state(None)
+    }
+
+    fn model_turn(&self) -> Pending {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        if self.workspace.is_some() {
+            let history = self.history.clone();
+            Box::pin(async move {
                 provider
-                    .models()
+                    .turn(&model, &history, &elphie_tools::definitions())
                     .await
-                    .map(Outcome::Models)
+                    .map(Outcome::Turn)
                     .map_err(provider_error)
             })
         } else {
-            self.messages.push(Message {
-                role: Role::User,
-                text: submission.text,
-            });
-            let messages = self.messages.clone();
-            let model = self.model.clone();
+            let messages: Vec<_> = self
+                .history
+                .iter()
+                .filter_map(|item| match item {
+                    ModelInput::Message(message) => Some(message.clone()),
+                    ModelInput::Tools { .. } => None,
+                })
+                .collect();
             Box::pin(async move {
                 provider
                     .complete(&model, &messages)
                     .await
-                    .map(Outcome::Reply)
+                    .map(|reply| Outcome::Turn(ModelTurn::Reply(reply)))
                     .map_err(provider_error)
             })
-        };
-        self.work = Some(Work::Running(pending));
-        self.send_state(None)
+        }
+    }
+
+    fn run_batch(&mut self, batch: Batch) -> Result<()> {
+        if let Some(call) = batch.next().cloned() {
+            let workspace = self.workspace.clone().ok_or_else(Error::internal_error)?;
+            let id = ToolCallId::new(Uuid::new_v4().to_string());
+            self.record(SessionUpdate::ToolCallUpdate(tool_call::started(
+                id.clone(),
+                &call,
+            )))?;
+            self.work = Some(Work::Reading(
+                id.clone(),
+                Box::pin(async move {
+                    let result = tool_call::execute(workspace, call).await;
+                    Ok(Outcome::ToolFinished(batch, id, result))
+                }),
+            ));
+        } else {
+            self.history.push(batch.into_history());
+            self.work = Some(Work::Running(self.model_turn()));
+        }
+        Ok(())
     }
 
     fn cancel(&mut self) -> Result<()> {
@@ -259,7 +322,19 @@ impl Session {
                 response.respond_with_error(Error::request_cancelled())?;
             }
         }
-        if self.work.take().is_some() {
+        if let Some(work) = self.work.take() {
+            let tool_id = match &work {
+                Work::Reading(id, _) => Some(id.clone()),
+                _ => None,
+            };
+            drop(work);
+            if let Some(id) = tool_id {
+                self.record(SessionUpdate::ToolCallUpdate(tool_call::finished(
+                    id,
+                    ToolCallStatus::Cancelled,
+                    "Cancelled.",
+                )))?;
+            }
             self.send_state(Some(StopReason::Cancelled))?;
         }
         Ok(())
@@ -267,12 +342,12 @@ impl Session {
 
     fn finish(&mut self, outcome: Result<Outcome>) -> Result<()> {
         let reason = match outcome {
-            Ok(Outcome::Reply(Completion { text, reason })) => {
+            Ok(Outcome::Turn(ModelTurn::Reply(Completion { text, reason }))) => {
                 if !text.is_empty() {
-                    self.messages.push(Message {
+                    self.history.push(ModelInput::Message(Message {
                         role: Role::Assistant,
                         text: text.clone(),
-                    });
+                    }));
                     self.agent_message(text, None)?;
                 }
                 match reason {
@@ -280,6 +355,30 @@ impl Session {
                     FinishReason::MaxTokens => StopReason::MaxTokens,
                     FinishReason::Refusal => StopReason::Refusal,
                 }
+            }
+            Ok(Outcome::Turn(ModelTurn::Tools(request))) => {
+                match Batch::new(request, &mut self.remaining_calls) {
+                    Ok(batch) => return self.run_batch(batch),
+                    Err(error) => error_stop(error),
+                }
+            }
+            Ok(Outcome::ToolFinished(mut batch, id, result)) => {
+                let (output, patch) = match result {
+                    Ok(output) => {
+                        let summary = format!("Returned {} bytes.", output.len());
+                        (
+                            output,
+                            tool_call::finished(id, ToolCallStatus::Completed, &summary),
+                        )
+                    }
+                    Err(error) => {
+                        let patch = tool_call::finished(id, ToolCallStatus::Failed, &error);
+                        (format!("Error: {error}"), patch)
+                    }
+                };
+                self.record(SessionUpdate::ToolCallUpdate(patch))?;
+                batch.push(output);
+                return self.run_batch(batch);
             }
             Ok(Outcome::FormUnsupported) => {
                 self.agent_message(
@@ -331,7 +430,7 @@ impl Session {
 
     fn send_state(&self, reason: Option<StopReason>) -> Result<()> {
         let state = match self.work {
-            Some(Work::Running(_)) => {
+            Some(Work::Running(_) | Work::Reading(_, _)) => {
                 StateUpdate::Running(RunningStateUpdate::new().background(vec![]))
             }
             Some(Work::Choosing(_)) => {

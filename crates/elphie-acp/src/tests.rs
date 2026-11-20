@@ -79,11 +79,16 @@ impl ClientIo {
     }
 
     fn with_catalog(catalog: Catalog) -> Self {
+        Self::with_provider(Arc::new(TestProvider { catalog }), None)
+    }
+
+    fn with_provider(provider: Arc<dyn Provider>, workspace: Option<Arc<Workspace>>) -> Self {
         let (client, server) = tokio::io::duplex(16384);
         let (reader, writer) = tokio::io::split(server);
         tokio::spawn(connect(
-            Arc::new(TestProvider { catalog }),
+            provider,
             ByteStreams::new(writer.compat_write(), reader.compat()),
+            workspace,
         ));
         let (output, input) = tokio::io::split(client);
         Self {
@@ -196,6 +201,9 @@ impl ClientIo {
         update.clone()
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod tools;
 
 #[tokio::test]
 async fn version_negotiation_and_baseline_sessions() {
