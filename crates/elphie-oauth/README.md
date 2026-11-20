@@ -26,10 +26,13 @@ For a Client ID Metadata Document (CIMD), host your JSON at an HTTPS URL. Set `c
 {
   "client_id": "https://example.com/elphie.json",
   "client_name": "Elphie",
+  "logo_uri": "https://example.com/elphie.webp",
   "redirect_uris": ["http://127.0.0.1:8765/callback"],
   "token_endpoint_auth_method": "none"
 }
 ```
+
+To show Elphie’s icon during authorization, host the [Elphie image](../elphie-acp/assets/elphie.webp) with your document and set `logo_uri` to its HTTPS URL.
 
 The resource must publish MCP protected resource metadata. Its authorization server must advertise S256 PKCE. If it supports CIMD, rmcp sends the document URL as the client ID. Otherwise rmcp attempts dynamic registration. Use `ClientIdentity::Dynamic` to start without a document. For an existing public client, pass `ClientIdentity::Preregistered { issuer, client_id }`.
 

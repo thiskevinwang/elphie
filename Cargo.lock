@@ -760,6 +760,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "elphie-core",
  "serde_json",
  "tokio",

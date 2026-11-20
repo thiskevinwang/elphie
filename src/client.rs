@@ -28,7 +28,11 @@ pub async fn run(
             let init = connection
                 .send_request(schema::InitializeRequest::new(
                     ProtocolVersion::V2,
-                    schema::Implementation::new("elphie-terminal", env!("CARGO_PKG_VERSION")),
+                    elphie_acp::implementation(
+                        "elphie-terminal",
+                        "Elphie Terminal",
+                        env!("CARGO_PKG_VERSION"),
+                    ),
                 ))
                 .block_task()
                 .await?;

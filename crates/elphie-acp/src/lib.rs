@@ -1,4 +1,7 @@
+mod metadata;
 mod session;
+
+pub use metadata::implementation;
 
 use std::{
     collections::HashMap,
@@ -53,8 +56,7 @@ async fn connect(
                 response.respond(
                     schema::InitializeResponse::new(
                         ProtocolVersion::V2,
-                        schema::Implementation::new("elphie", env!("CARGO_PKG_VERSION"))
-                            .title("Elphie"),
+                        implementation("elphie", "Elphie", env!("CARGO_PKG_VERSION")),
                     )
                     .capabilities(
                         schema::AgentCapabilities::new()

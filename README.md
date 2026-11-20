@@ -1,5 +1,7 @@
 # Elphie
 
+<img src="crates/elphie-acp/assets/elphie.webp" width="96" height="96" alt="Elphie, a black and white cat">
+
 Elphie is a text chat agent written in Rust. The terminal opens a conversation with an Elphie server over standard input and output. A desktop client can start the same server and use the same ACP v2 messages.
 
 ## Start a conversation
@@ -31,6 +33,8 @@ Start `elphie serve` as a child process. Use the same provider and model flags a
 3. Send `session/prompt` with that ID and text content. The response identifies the accepted user message.
 4. Apply `session/update` notifications to the conversation in receive order. Match each message by role and ID. A `state_update` with state `idle` tells the UI that foreground work has ended.
 5. Send `session/cancel` to stop current work. Send `session/close` when the view closes.
+
+To show Elphie’s icon, read `info._meta["io.github.thiskevinwang.elphie/icon"]` during initialization. The agent and terminal use this extension to send an ACP `Icon` with a 192 × 192 WebP data URI in `src`. Clients can display it offline. [ACP metadata extensions](https://agentclientprotocol.com/protocol/v2/extensibility)
 
 The server also supports listing sessions, resuming them with transcript replay, and retrying submissions with an idempotency key. Resource links enter the prompt as a name and URI. This release supports text conversations and requests no filesystem, shell, or MCP tool permissions. ACP v2 is a draft. The project pins its Rust SDK version. [ACP v2](https://agentclientprotocol.com/protocol/v2/overview) · [Rust SDK](https://agentclientprotocol.com/libraries/rust)
 
