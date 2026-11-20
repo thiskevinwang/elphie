@@ -45,9 +45,9 @@ pub(crate) fn config_dir() -> Result<PathBuf> {
         ensure!(dir.is_absolute(), "ELPHIE_CONFIG_DIR must be absolute");
         return Ok(dir);
     }
-    Ok(dirs::config_dir()
-        .context("Cannot locate the user configuration directory")?
-        .join("elphie"))
+    Ok(dirs::home_dir()
+        .context("Cannot locate the user's home directory")?
+        .join(".elphie"))
 }
 
 impl Store {

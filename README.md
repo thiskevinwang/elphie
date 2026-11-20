@@ -12,7 +12,7 @@ elphie login
 elphie
 ```
 
-Sign-in opens the system browser. Elphie registers its own client, saves the approved registration locally, and refreshes its token when needed. On macOS, the default directory is `~/Library/Application Support/elphie/`. Set `ELPHIE_CONFIG_DIR` to use a different private directory. Run `elphie logout` to sign out of the active registration. [ChatGPT plan authorization](https://developers.openai.com/siwc/token-sharing-open-source)
+Sign-in opens the system browser. Elphie saves the registration in `~/.elphie` and refreshes its token when needed. Set `ELPHIE_CONFIG_DIR` to the absolute path of a different private directory. To keep using a registration from an earlier version, set this variable to its existing directory. Run `elphie logout` to sign out of the active registration. [ChatGPT plan authorization](https://developers.openai.com/siwc/token-sharing-open-source)
 
 The default model is `gpt-6.1-sol`. Use `elphie --model <model>` to select another model available to the account. For Ollama, start the local service. Substitute an installed model name from `ollama list` in this example.
 
