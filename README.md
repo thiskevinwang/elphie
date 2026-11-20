@@ -28,6 +28,18 @@ Press Shift+Enter to add a line. If your terminal sends the same key code for En
 
 With an empty draft, press ↑ to recall a prompt from this session or `?` to show keyboard shortcuts. Press `?` again to start a message with a question mark. You can edit a recalled prompt before sending it. In a multiline draft, ↑ and ↓ move between lines.
 
+## Give Elphie read access to a directory
+
+```sh
+elphie --tools .
+```
+
+Ask “Read README.md and summarize the install steps.” Elphie can call `list_directory` and `read_file`. The terminal shows the read-only directory and the status of each call. **The selected model provider receives directory listings and file contents.** Choose a directory on a trusted filesystem whose contents you can share. Git-ignored files are readable if they meet the same access rules. For Ollama, select a model that supports tools.
+
+File tools are off by default. The directory passed to `--tools` sets the read boundary for every session on that server. A model request or a client's working directory cannot expand it. File tools accept relative paths, skip dotfiles and reject symbolic links, multiply linked files, and special files. They cannot run commands, change files, or make network requests. This scope follows the principle of enforcing access limits outside the model. [Inside the Codex sandbox](https://openai.com/index/inside-the-codex-sandbox/)
+
+A prompt can make up to eight tool calls. Each call returns up to 32 KiB. File reads require UTF-8 text. Directory listings return up to 256 visible entries and stop with an error if the directory exceeds the scan limit of 1,024 entries. Tool access requires macOS with `O_NOFOLLOW_ANY` or Linux with `openat2`. Linux rejects kernel filesystems such as `/proc` and `/sys` as tool directories.
+
 ## Connect a desktop client
 
 Start `elphie serve` as a child process. Use the same provider and model flags as the terminal. Exchange one JSON-RPC message per line on its standard streams.
@@ -42,7 +54,9 @@ To show Elphie’s icon, read `info._meta["io.github.thiskevinwang.elphie/icon"]
 
 To enable `/model`, advertise `"elicitation": {"form": {}}` in the client capabilities. When the user sends the command, display the model choices from `elicitation/create`. Return the selected model ID in `content.model` with the `accept` action, or return `cancel` to keep the current model. [ACP form elicitation](https://agentclientprotocol.com/protocol/v2/elicitation)
 
-The server also supports listing sessions, resuming them with transcript replay, and retrying submissions with an idempotency key. Resource links enter the prompt as a name and URI. This release supports text conversations and requests no filesystem, shell, or MCP tool permissions. ACP v2 is a draft. The project pins its Rust SDK version. [ACP v2](https://agentclientprotocol.com/protocol/v2/overview) · [Rust SDK](https://agentclientprotocol.com/libraries/rust)
+Start `elphie serve --tools ./project` to grant the same read access for a desktop client. Apply each `tool_call_update` to its `toolCallId`. A later update changes the same transcript row. The server sends the path, status, and result size or error. File contents go to the model. [ACP tool calls](https://agentclientprotocol.com/protocol/v2/tool-calls)
+
+The server also supports listing sessions, resuming them with transcript replay, and retrying submissions with an idempotency key. Resource links enter the prompt as a name and URI. ACP v2 is a draft. The project pins its Rust SDK version. [ACP v2](https://agentclientprotocol.com/protocol/v2/overview) · [Rust SDK](https://agentclientprotocol.com/libraries/rust)
 
 ## Code map
 
@@ -53,7 +67,8 @@ The server also supports listing sessions, resuming them with transcript replay,
 | `elphie-view-model` | Apply user intents and agent events to the draft, prompt history, transcript, and picker. |
 | `src/client.rs` | Send actions over ACP and translate replies into view-model events. Own pending form replies. |
 | `elphie-core` | Define provider-independent messages and the provider interface. |
-| `elphie-acp` | Own session history, prompt ordering, cancellation, and replay. |
+| `elphie-acp` | Own session history, tool execution order, cancellation, and replay. |
+| `elphie-tools` | Define the workspace tools and enforce read limits through the operating system. |
 | `elphie-providers` | Send conversation history to ChatGPT or Ollama. |
 | `elphie-signin` | Register Elphie with ChatGPT and manage its account credentials. |
 | `elphie-oauth` | Authorize a host to access an MCP resource with the official Rust MCP SDK. |
@@ -73,7 +88,7 @@ cargo build --locked
 python3 tests/terminal.py
 ```
 
-The last check needs a Unix pseudo-terminal. It exercises shortcuts, model filtering, terminal resize, prompt recall, and cancellation. A local HTTP fixture checks which model received the messages and their conversation history.
+The last check uses a pseudo-terminal and a local Ollama fixture. It covers model selection, multiline input, cancellation, and tool calls. It checks that a permitted file reaches the provider and that a symbolic link to another directory fails.
 
 To run the upstream ACP suite with the same local fixture, install the tested revision of the kit and run the following commands. The report lists exercised and skipped requirements. [ACP compatibility kit](https://github.com/agentclientprotocol/acp-tck/tree/7c71c4d1af0994e73bdc100c9f7f6b98f2319cda)
 

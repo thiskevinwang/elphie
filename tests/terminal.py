@@ -1,6 +1,7 @@
 """Exercise the built terminal and server with a local Ollama fixture on Unix."""
 
 import codecs
+import contextlib
 import errno
 import fcntl
 import http.server
@@ -14,6 +15,7 @@ import select
 import signal
 import struct
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -25,6 +27,8 @@ release = threading.Event()
 
 
 class Model(http.server.BaseHTTPRequestHandler):
+    tool_models = ()
+
     def do_GET(self):
         if self.path != "/api/tags":
             return self.send_error(404)
@@ -33,15 +37,21 @@ class Model(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.path == "/api/show":
-            return self.respond({"capabilities": ["completion"]})
+            capabilities = ["completion"]
+            if body["model"] in self.tool_models:
+                capabilities.append("tools")
+            return self.respond({"capabilities": capabilities})
         if self.path != "/api/chat":
             return self.send_error(404)
         requests.put((self.path, body))
+        self.respond({"done": True, "message": self.completion(body)})
+
+    def completion(self, body):
         prompt = body["messages"][-1]["content"]
         if prompt == "hold":
             release.wait(timeout=15)
         reply = "FIRST_REPLY" if prompt == "hello" else "NEXT_REPLY"
-        self.respond({"done": True, "message": {"role": "assistant", "content": reply}})
+        return {"role": "assistant", "content": reply}
 
     def respond(self, value):
         output = json.dumps(value).encode()
@@ -125,20 +135,50 @@ class TerminalOutput:
             self.feed(block)
 
 
-def main():
-    program = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/elphie").resolve()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Model)
+@contextlib.contextmanager
+def terminal(program, handler, *args):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
     pid, fd = pty.fork()
     if pid == 0:
         server.server_close()
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 90, 0, 0))
         os.execv(program, [str(program), "--provider", "ollama", "--model", "fixture",
-                           "--ollama-host", f"http://127.0.0.1:{port}"])
+                           "--ollama-host", f"http://127.0.0.1:{port}", *args])
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         output = TerminalOutput(fd)
+        yield fd, output
+        os.write(fd, b"\x03")
+        output.expect("\x1b[<1u", "\x1b[?1049l")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            child, status = os.waitpid(pid, os.WNOHANG)
+            if child:
+                pid = None
+                assert os.waitstatus_to_exitcode(status) == 0, status
+                break
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    os.read(fd, 65536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+        else:
+            raise AssertionError("Elphie did not exit after Ctrl+C")
+    finally:
+        release.set()
+        os.close(fd)
+        if pid:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        server.shutdown()
+        server.server_close()
+
+
+def check_chat(program):
+    with terminal(program, Model) as (fd, output):
         expect = output.expect
         expect("\x1b[>1u", "Elphie", "fixture", "Ask Elphie", "? for shortcuts")
 
@@ -197,33 +237,56 @@ def main():
         expect("Working", absent=("Cancelled",))
         os.write(fd, b"\x1b")
         expect("Cancelled")
-        os.write(fd, b"\x03")
-        expect("\x1b[<1u", "\x1b[?1049l")
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            child, status = os.waitpid(pid, os.WNOHANG)
-            if child:
-                pid = None
-                assert os.waitstatus_to_exitcode(status) == 0, status
-                break
-            if select.select([fd], [], [], 0.05)[0]:
-                try:
-                    os.read(fd, 65536)
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
+
+
+class ToolModel(Model):
+    tool_models = ("fixture",)
+
+    def completion(self, body):
+        messages = body["messages"]
+        outputs = [msg for msg in messages if msg["role"] == "tool"]
+        if len(outputs) == 3:
+            return {"role": "assistant", "content": "READS_FINISHED"}
+        if outputs:
+            calls = [("read_file", "report.txt"), ("read_file", "linked.txt")]
         else:
-            raise AssertionError("Elphie did not exit after Ctrl+C")
-        print("Passed: shortcuts, model search and selection, resize, multiline recall, cancellation, clean exit.")
-    finally:
-        release.set()
-        os.close(fd)
-        if pid:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        server.shutdown()
-        server.server_close()
+            calls = [("list_directory", ".")]
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": name, "arguments": {"path": path}}} for name, path in calls
+        ]}
+
+
+def check_tools(program):
+    with tempfile.TemporaryDirectory() as scratch:
+        workspace = pathlib.Path(scratch) / "project"
+        workspace.mkdir()
+        (workspace / "report.txt").write_text("FILE_FIXTURE_742")
+        outside = pathlib.Path(scratch) / "outside.txt"
+        outside.write_text("OUTSIDE_FIXTURE_289")
+        (workspace / "linked.txt").symlink_to(outside)
+        with terminal(program, ToolModel, "--tools", str(workspace)) as (fd, output):
+            output.expect("read-only", "? for shortcuts")
+            os.write(fd, b"/model")
+            output.expect("Select a model", "fixture (current)", absent=("orchid",))
+            os.write(fd, b"\x1b")
+            output.expect("Cancelled")
+            os.write(fd, b"inspect\r")
+            output.expect("List directory . · done", "Read file report.txt · done",
+                          "Read file linked.txt · failed", "READS_FINISHED",
+                          absent=("FILE_FIXTURE_742", "OUTSIDE_FIXTURE_289"))
+            bodies = [requests.get(timeout=5)[1] for _ in range(3)]
+            for body in bodies:
+                assert {tool["function"]["name"] for tool in body["tools"]} == {"list_directory", "read_file"}
+                assert "OUTSIDE_FIXTURE_289" not in json.dumps(body)
+            results = [m for m in bodies[-1]["messages"] if m["role"] == "tool"]
+            assert [m["tool_name"] for m in results] == ["list_directory", "read_file", "read_file"]
+            assert "report.txt" in results[0]["content"]
+            assert "FILE_FIXTURE_742" in results[1]["content"]
+            assert results[2]["content"] and "FILE_FIXTURE_742" not in results[2]["content"]
 
 
 if __name__ == "__main__":
-    main()
+    program = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/elphie").resolve()
+    check_chat(program)
+    check_tools(program)
+    print("Passed terminal chat, model selection, cancellation, workspace tool calls and clean exit.")

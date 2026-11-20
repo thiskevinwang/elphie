@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use elphie_core::{ModelOption, Role};
-use elphie_view_model::{Action, Edit, Event, FormId, ModelChoice, Phase};
+use elphie_view_model::{Action, Edit, Event, FormId, ModelChoice, Phase, ToolStatus};
 
 #[derive(Default)]
 struct PendingForms {
@@ -246,6 +246,28 @@ fn project(update: schema::SessionUpdate) -> Option<Event> {
             m.message_id.to_string(),
             Edit::Append(text(m.content)),
         ),
+        U::ToolCallUpdate(call) => {
+            use schema::ToolCallStatus as S;
+            Event::ToolUpdate {
+                id: call.tool_call_id.to_string(),
+                title: match call.title {
+                    MaybeUndefined::Undefined => None,
+                    MaybeUndefined::Null => Some(String::new()),
+                    MaybeUndefined::Value(title) => Some(title),
+                },
+                status: match call.status {
+                    MaybeUndefined::Undefined => None,
+                    MaybeUndefined::Null | MaybeUndefined::Value(S::Pending) => {
+                        Some(ToolStatus::Pending)
+                    }
+                    MaybeUndefined::Value(S::Paused) => Some(ToolStatus::Paused),
+                    MaybeUndefined::Value(S::Completed) => Some(ToolStatus::Completed),
+                    MaybeUndefined::Value(S::Cancelled) => Some(ToolStatus::Cancelled),
+                    MaybeUndefined::Value(S::Failed) => Some(ToolStatus::Failed),
+                    MaybeUndefined::Value(_) => Some(ToolStatus::InProgress),
+                },
+            }
+        }
         U::StateUpdate(S::Idle(state)) => match state.stop_reason {
             Some(StopReason::Error(reason)) => Event::Failed(
                 reason

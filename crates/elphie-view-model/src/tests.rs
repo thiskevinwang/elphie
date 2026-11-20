@@ -6,6 +6,32 @@ fn ready() -> Chat {
     chat
 }
 
+#[test]
+fn tool_patches_update_one_row_and_keep_message_order() {
+    let mut chat = ready();
+    chat.apply(Event::ToolUpdate {
+        id: "1".into(),
+        title: Some("Read notes.txt".into()),
+        status: Some(ToolStatus::InProgress),
+    });
+    chat.apply(Event::Message(
+        Role::Assistant,
+        "1".into(),
+        Edit::Replace("Found it".into()),
+    ));
+    for _ in 0..2 {
+        chat.apply(Event::ToolUpdate {
+            id: "1".into(),
+            title: None,
+            status: Some(ToolStatus::Completed),
+        });
+    }
+    assert!(
+        matches!(chat.entries(), [TranscriptEntry::Tool(tool), TranscriptEntry::Message { .. }]
+        if tool.status == ToolStatus::Completed && tool.title == "Read notes.txt")
+    );
+}
+
 fn send(chat: &mut Chat, text: &str) {
     chat.handle(Intent::Paste(text.into()));
     assert_eq!(chat.handle(Intent::Submit), Some(Action::Send(text.into())));
@@ -209,7 +235,9 @@ fn message_edits_match_role_and_id_and_submit_waits_until_idle() {
     ));
     chat.apply(Event::Phase(Phase::Ready));
     assert_eq!(chat.entries().len(), 2);
-    assert_eq!(chat.entries()[1].1.text, "hello!");
+    assert!(
+        matches!(&chat.entries()[1], TranscriptEntry::Message { message, .. } if message.text == "hello!")
+    );
     assert_eq!(
         chat.handle(Intent::Submit),
         Some(Action::Send("next".into()))

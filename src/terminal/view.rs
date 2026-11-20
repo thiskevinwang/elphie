@@ -1,7 +1,7 @@
 use std::env;
 
 use elphie_core::Role;
-use elphie_view_model::{Chat, ModelPicker, Phase};
+use elphie_view_model::{Chat, ModelPicker, Phase, ToolStatus, TranscriptEntry};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -111,12 +111,27 @@ fn transcript(frame: &mut Frame, area: Rect, chat: &Chat, above_bottom: &mut u16
     let mut turns: Vec<_> = chat
         .entries()
         .iter()
-        .map(|(_, message)| {
-            let prefix = match message.role {
-                Role::User => "›".bold(),
-                Role::Assistant => "•".dim(),
-            };
-            Turn::new(prefix, &message.text, width)
+        .map(|entry| match entry {
+            TranscriptEntry::Message { message, .. } => {
+                let prefix = match message.role {
+                    Role::User => "›".bold(),
+                    Role::Assistant => "•".dim(),
+                };
+                Turn::new(prefix, &message.text, width)
+            }
+            TranscriptEntry::Tool(tool) => {
+                let (prefix, status) = match tool.status {
+                    ToolStatus::Pending => ("·".dim(), "pending"),
+                    ToolStatus::InProgress => ("·".dim(), "running"),
+                    ToolStatus::Paused => ("·".dim(), "paused"),
+                    ToolStatus::Completed => ("✓".dim(), "done"),
+                    ToolStatus::Failed => ("!".red(), "failed"),
+                    ToolStatus::Cancelled => ("×".dim(), "cancelled"),
+                };
+                let title = inline(&tool.title);
+                let title = if title.is_empty() { "Tool" } else { &title };
+                Turn::new(prefix, &format!("{title} · {status}"), width)
+            }
         })
         .collect();
     if let Some(error) = chat.error() {
@@ -162,7 +177,10 @@ fn session_header(frame: &mut Frame, area: Rect, chat: &Chat, provider: &str) {
         return;
     }
     let area = inset(area);
-    let details = format!("{} · {}", inline(chat.model()), inline(provider));
+    let mut details = format!("{} · {}", inline(chat.model()), inline(provider));
+    if let Some(directory) = chat.read_directory() {
+        details.push_str(&format!(" · read-only {}", inline(directory)));
+    }
     if area.height >= 3 {
         let (_, content) = split_top(area, 1);
         let (title, info) = split_top(content, 1);

@@ -1,12 +1,13 @@
 mod client;
 mod terminal;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{AcpAgent, AcpAgentConfig};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use elphie_core::Provider;
+use elphie_view_model::Chat;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -40,6 +41,13 @@ struct Options {
         default_value = "http://127.0.0.1:11434"
     )]
     ollama_host: String,
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIRECTORY",
+        help = "Let the model list and read files in this directory. Results go to the selected provider"
+    )]
+    tools: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -87,9 +95,16 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow!(e))?,
             ),
         };
-        return elphie_acp::serve(provider).await;
+        let workspace = options
+            .tools
+            .as_deref()
+            .map(elphie_tools::Workspace::open)
+            .transpose()
+            .context("Could not open the workspace for tools")?
+            .map(Arc::new);
+        return elphie_acp::serve_with_tools(provider, workspace).await;
     }
-    let agent = AcpAgent::new(AcpAgentConfig::new(std::env::current_exe()?).args([
+    let mut config = AcpAgentConfig::new(std::env::current_exe()?).args([
         "serve",
         "--provider",
         name,
@@ -97,14 +112,23 @@ async fn main() -> Result<()> {
         &model,
         "--ollama-host",
         &options.ollama_host,
-    ]));
+    ]);
+    let mut chat = Chat::new(&model);
+    if let Some(path) = options.tools {
+        let directory = path
+            .to_str()
+            .context("The terminal requires a UTF-8 workspace path")?;
+        config = config.arg(format!("--tools={directory}"));
+        chat = chat.with_read_directory(directory);
+    }
+    let agent = AcpAgent::new(config);
     let (send_action, actions) = mpsc::unbounded_channel();
     let (events, receive_event) = mpsc::unbounded_channel();
     let connection = client::run(agent, actions, events);
     tokio::pin!(connection);
     tokio::select! {
         result = &mut connection => result.context("ACP connection closed"),
-        result = terminal::run(name, &model, send_action, receive_event) => {
+        result = terminal::run(name, chat, send_action, receive_event) => {
             result?;
             connection.await
         }

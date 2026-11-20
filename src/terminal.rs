@@ -72,7 +72,7 @@ fn key_command(key: KeyEvent) -> Option<TerminalCommand> {
 
 pub async fn run(
     provider: &str,
-    model: &str,
+    mut chat: Chat,
     actions: UnboundedSender<Action>,
     mut events: UnboundedReceiver<Event>,
 ) -> Result<()> {
@@ -89,7 +89,6 @@ pub async fn run(
     crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let background = view::composer_background();
     let mut inputs = EventStream::new();
-    let mut chat = Chat::new(model);
     let mut above_bottom: u16 = 0;
     loop {
         terminal.draw(|frame| view::draw(frame, &chat, provider, &mut above_bottom, background))?;

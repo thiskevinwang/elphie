@@ -48,9 +48,36 @@ pub enum Edit {
     Replace(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+pub struct ToolActivity {
+    pub id: String,
+    pub title: String,
+    pub status: ToolStatus,
+}
+
+pub enum TranscriptEntry {
+    Message { id: String, message: Message },
+    Tool(ToolActivity),
+}
+
 pub enum Event {
     Phase(Phase),
     Message(Role, String, Edit),
+    ToolUpdate {
+        id: String,
+        title: Option<String>,
+        status: Option<ToolStatus>,
+    },
     Failed(String),
     ChooseModel {
         request_id: FormId,
@@ -73,9 +100,10 @@ pub enum ModelChoice {
 pub struct Chat {
     draft: Draft,
     phase: Phase,
-    entries: Vec<(String, Message)>,
+    entries: Vec<TranscriptEntry>,
     error: Option<String>,
     model: String,
+    read_directory: Option<String>,
     help_open: bool,
     pickers: VecDeque<ModelPicker>,
     prompts: Vec<String>,
@@ -98,7 +126,7 @@ impl Chat {
         self.phase
     }
 
-    pub fn entries(&self) -> &[(String, Message)] {
+    pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
     }
 
@@ -108,6 +136,15 @@ impl Chat {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn with_read_directory(mut self, directory: impl Into<String>) -> Self {
+        self.read_directory = Some(directory.into());
+        self
+    }
+
+    pub fn read_directory(&self) -> Option<&str> {
+        self.read_directory.as_deref()
     }
 
     pub fn help_open(&self) -> bool {
@@ -264,24 +301,45 @@ impl Chat {
             }
             Event::ModelChanged(model) => self.model = model,
             Event::Message(role, id, edit) => {
-                let index = self
-                    .entries
-                    .iter()
-                    .position(|(key, msg)| *key == id && msg.role == role)
-                    .unwrap_or_else(|| {
-                        self.entries.push((
-                            id,
-                            Message {
-                                role,
-                                text: String::new(),
-                            },
-                        ));
-                        self.entries.len() - 1
+                let existing = self.entries.iter_mut().find_map(|entry| match entry {
+                    TranscriptEntry::Message { id: key, message }
+                        if *key == id && message.role == role =>
+                    {
+                        Some(message)
+                    }
+                    _ => None,
+                });
+                if let Some(message) = existing {
+                    match edit {
+                        Edit::Append(text) => message.text.push_str(&text),
+                        Edit::Replace(text) => message.text = text,
+                    }
+                } else {
+                    let (Edit::Append(text) | Edit::Replace(text)) = edit;
+                    self.entries.push(TranscriptEntry::Message {
+                        id,
+                        message: Message { role, text },
                     });
-                let message = &mut self.entries[index].1;
-                match edit {
-                    Edit::Append(text) => message.text.push_str(&text),
-                    Edit::Replace(text) => message.text = text,
+                }
+            }
+            Event::ToolUpdate { id, title, status } => {
+                let existing = self.entries.iter_mut().find_map(|entry| match entry {
+                    TranscriptEntry::Tool(tool) if tool.id == id => Some(tool),
+                    _ => None,
+                });
+                if let Some(tool) = existing {
+                    if let Some(title) = title {
+                        tool.title = title;
+                    }
+                    if let Some(status) = status {
+                        tool.status = status;
+                    }
+                } else {
+                    self.entries.push(TranscriptEntry::Tool(ToolActivity {
+                        id,
+                        title: title.unwrap_or_default(),
+                        status: status.unwrap_or_default(),
+                    }));
                 }
             }
         }

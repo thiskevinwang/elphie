@@ -748,6 +748,7 @@ dependencies = [
  "elphie-core",
  "elphie-providers",
  "elphie-signin",
+ "elphie-tools",
  "elphie-view-model",
  "futures-util",
  "ratatui",
