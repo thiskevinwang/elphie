@@ -748,6 +748,7 @@ dependencies = [
  "elphie-core",
  "elphie-providers",
  "elphie-signin",
+ "elphie-view-model",
  "futures-util",
  "ratatui",
  "tokio",
@@ -826,6 +827,13 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "elphie-view-model"
+version = "0.1.0"
+dependencies = [
+ "elphie-core",
 ]
 
 [[package]]

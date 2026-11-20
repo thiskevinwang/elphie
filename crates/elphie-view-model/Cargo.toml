@@ -1,0 +1,8 @@
+[package]
+name = "elphie-view-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+elphie-core = { path = "../elphie-core" }
