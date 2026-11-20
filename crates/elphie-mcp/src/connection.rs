@@ -45,7 +45,6 @@ impl Connection {
                     .max_sse_event_size(MAX_WIRE_BYTES)
                     .max_json_response_size(MAX_WIRE_BYTES)
                     .max_error_response_size(0);
-                config.reinit_on_expired_session = false;
                 let service = if let Some(grant) = grant {
                     let (resource, manager) = grant.into_parts();
                     ensure!(

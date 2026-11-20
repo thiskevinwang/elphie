@@ -1,6 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+};
 use elphie_mcp::{McpClient, ServerConfig, TransportConfig};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -39,6 +45,82 @@ async fn handle(State(calls): State<Calls>, Json(message): Json<Value>) -> Json<
         unexpected => panic!("Unexpected method {unexpected}"),
     };
     Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result}))
+}
+
+#[derive(Default)]
+struct LegacySession {
+    initializations: usize,
+    expired_calls: usize,
+    executions: usize,
+}
+
+async fn legacy(
+    State(session): State<Arc<Mutex<LegacySession>>>,
+    headers: HeaderMap,
+    Json(message): Json<Value>,
+) -> Response {
+    let mut session = session.lock().unwrap();
+    let reply = |result: Value| Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result}));
+    match message["method"].as_str().unwrap() {
+        "server/discover" => Json(json!({"jsonrpc":"2.0","id":message["id"],"error":{"code":-32601,"message":"Unknown method"}})).into_response(),
+        "initialize" => {
+            session.initializations += 1;
+            let id = format!("session-{}", session.initializations);
+            ([("mcp-session-id", id)], reply(json!({
+                "protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+                "serverInfo":{"name":"fixture","version":"1"}
+            }))).into_response()
+        }
+        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "tools/list" => reply(json!({"tools":[{"name":"lookup","inputSchema":{"type":"object"}}]})).into_response(),
+        "tools/call" if headers["mcp-session-id"] == "session-1" => {
+            session.expired_calls += 1;
+            StatusCode::NOT_FOUND.into_response()
+        }
+        "tools/call" => {
+            assert_eq!(headers["mcp-session-id"], "session-2");
+            session.executions += 1;
+            reply(json!({"content":[{"type":"text","text":"done"}]})).into_response()
+        }
+        unexpected => panic!("Unexpected method {unexpected}"),
+    }
+}
+
+#[tokio::test]
+async fn recovers_an_expired_http_session_before_executing_the_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}/mcp", listener.local_addr().unwrap())).unwrap();
+    let session = Arc::new(Mutex::new(LegacySession::default()));
+    let app = Router::new()
+        .route("/mcp", post(legacy))
+        .with_state(session.clone());
+    tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    let client = McpClient::connect(&[ServerConfig {
+        name: "notes".into(),
+        tools: vec!["lookup".into()],
+        transport: TransportConfig::Http {
+            url,
+            bearer_token_env: None,
+        },
+    }])
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .execute("mcp_notes__lookup", &json!({}))
+            .await
+            .unwrap(),
+        "done"
+    );
+    let counts = session.lock().unwrap();
+    assert_eq!(
+        (
+            counts.initializations,
+            counts.expired_calls,
+            counts.executions
+        ),
+        (2, 1, 1)
+    );
 }
 
 #[tokio::test]
